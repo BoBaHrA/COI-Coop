@@ -5,4 +5,13 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>CoiCoop</AssemblyName>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Mafi">
+      <HintPath>$(COI_ROOT)\Captain of Industry_Data\Managed\Mafi.dll</HintPath>
+    </Reference>
+    <Reference Include="Mafi.Core">
+      <HintPath>$(COI_ROOT)\Captain of Industry_Data\Managed\Mafi.Core.dll</HintPath>
+    </Reference>
+  </ItemGroup>
 </Project>
