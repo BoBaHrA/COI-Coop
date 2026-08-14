@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using CoiCoop.Networking;
@@ -18,6 +19,10 @@ public sealed class CoiCoopMod : IMod {
     private InputScheduler m_scheduler;
     private ISimLoopEvents m_simLoop;
     private CommandRoundTripProbe m_roundTripProbe;
+    private FieldInfo m_commandsToProcessField;
+    private readonly HashSet<string> m_preprocessSeenTypes = new HashSet<string>(StringComparer.Ordinal);
+    private bool m_preprocessPassthroughConfirmed;
+    private bool m_preprocessFailureLogged;
     private bool m_gameHooksAttached;
     private int m_transportProbeStarted;
 
@@ -99,11 +104,68 @@ public sealed class CoiCoopMod : IMod {
             return;
         }
 
+        m_commandsToProcessField = commandsField;
+        m_simLoop.UpdateBeforeCmdProc.AddNonSaveable(this, OnBeforeCommandProcessing);
         m_scheduler.OnCommandProcessed.AddNonSaveable(this, OnCommandProcessed);
         m_gameHooksAttached = true;
 
         Log.Info("COI-Coop: COMPATIBILITY OK - InputScheduler command queue found");
+        Log.Info("COI-Coop: pre-processing passthrough probe attached");
         Log.Info("COI-Coop: command observer attached");
+    }
+
+    private void OnBeforeCommandProcessing() {
+        if (!JsonConfig.GetBool("probe_preprocess_passthrough")
+            || m_scheduler == null
+            || m_commandsToProcessField == null) {
+            return;
+        }
+
+        try {
+            var value = m_commandsToProcessField.GetValue(m_scheduler);
+            if (!(value is Lyst<IInputCommand> commands)) {
+                if (!m_preprocessFailureLogged) {
+                    m_preprocessFailureLogged = true;
+                    Log.Info("COI-Coop: PREPROCESS FAIL - command queue has unexpected runtime type");
+                }
+                return;
+            }
+
+            if (commands.Count == 0) {
+                return;
+            }
+
+            // Dry-run for the future lockstep path. We take ownership of the queue,
+            // then restore the exact same command objects in the exact same order.
+            // No command is delayed, cloned, dropped, or executed by the mod here.
+            var captured = new List<IInputCommand>(commands.Count);
+            foreach (var command in commands) {
+                captured.Add(command);
+            }
+
+            commands.Clear();
+            foreach (var command in captured) {
+                commands.Add(command);
+            }
+
+            if (!m_preprocessPassthroughConfirmed) {
+                m_preprocessPassthroughConfirmed = true;
+                Log.Info("COI-Coop: PREPROCESS PASSTHROUGH OK count=" + captured.Count);
+            }
+
+            foreach (var command in captured) {
+                var typeName = command.GetType().FullName;
+                if (m_preprocessSeenTypes.Add(typeName)) {
+                    Log.Info("COI-Coop: PREPROCESS SEEN " + typeName);
+                }
+            }
+        }
+        catch (Exception ex) {
+            if (!m_preprocessFailureLogged) {
+                m_preprocessFailureLogged = true;
+                Log.Info("COI-Coop: PREPROCESS FAIL - " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
     }
 
     private void OnCommandProcessed(IInputCommand command) {
@@ -202,6 +264,10 @@ public sealed class CoiCoopMod : IMod {
         m_scheduler = null;
         m_simLoop = null;
         m_roundTripProbe = null;
+        m_commandsToProcessField = null;
+        m_preprocessSeenTypes.Clear();
+        m_preprocessPassthroughConfirmed = false;
+        m_preprocessFailureLogged = false;
         m_gameHooksAttached = false;
     }
 }
