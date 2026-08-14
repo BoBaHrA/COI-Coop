@@ -1,6 +1,11 @@
 {
   "id": "CoiCoop",
   "version": "0.0.1",
+  "display_name": "COI Co-op Prototype",
+  "description_short": "Experimental co-op transport foundation. Local TCP is used only when enabled.",
+  "authors": "BoBaHrA",
   "primary_dlls": [ "CoiCoop.dll" ],
-  "non_locking_dll_load": true
+  "non_locking_dll_load": true,
+  "can_add_to_saved_game": true,
+  "can_remove_from_saved_game": true
 }
