@@ -17,6 +17,7 @@ public sealed class CoiCoopMod : IMod {
     private DependencyResolver m_resolver;
     private InputScheduler m_scheduler;
     private ISimLoopEvents m_simLoop;
+    private CommandRoundTripProbe m_roundTripProbe;
     private bool m_gameHooksAttached;
     private int m_transportProbeStarted;
 
@@ -47,6 +48,7 @@ public sealed class CoiCoopMod : IMod {
 
     public void Initialize(DependencyResolver resolver, bool gameWasLoaded) {
         m_resolver = resolver;
+        m_roundTripProbe = new CommandRoundTripProbe(resolver);
         Log.Info("COI-Coop: Initialize; gameWasLoaded=" + gameWasLoaded);
 
         InputScheduler scheduler;
@@ -105,11 +107,30 @@ public sealed class CoiCoopMod : IMod {
     }
 
     private void OnCommandProcessed(IInputCommand command) {
-        if (!JsonConfig.GetBool("trace_commands")) {
+        var commandType = command.GetType().FullName;
+
+        if (JsonConfig.GetBool("trace_commands")) {
+            Log.Info("COI-Coop: INPUT " + commandType);
+        }
+
+        if (!JsonConfig.GetBool("probe_command_serialization") || m_roundTripProbe == null) {
             return;
         }
 
-        Log.Info("COI-Coop: INPUT " + command.GetType().FullName);
+        int payloadLength;
+        string cloneType;
+        string error;
+        if (m_roundTripProbe.TryRoundTrip(command, out payloadLength, out cloneType, out error)) {
+            Log.Info(
+                "COI-Coop: SERIALIZE OK type=" + commandType
+                + " bytes=" + payloadLength
+                + " clone=" + cloneType);
+        }
+        else {
+            Log.Info(
+                "COI-Coop: SERIALIZE FAIL type=" + commandType
+                + " error=" + error);
+        }
     }
 
     private void StartTransportProbe() {
@@ -180,6 +201,7 @@ public sealed class CoiCoopMod : IMod {
         m_resolver = null;
         m_scheduler = null;
         m_simLoop = null;
+        m_roundTripProbe = null;
         m_gameHooksAttached = false;
     }
 }
