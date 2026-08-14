@@ -20,5 +20,9 @@
   "probe_command_serialization": {
     "default": true,
     "description": "Development option: serialize and immediately deserialize each processed input command without executing the clone."
+  },
+  "probe_preprocess_passthrough": {
+    "default": true,
+    "description": "Development option: intercept the pending InputScheduler queue before processing and restore the exact same command objects in the exact same order."
   }
 }
