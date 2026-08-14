@@ -8,6 +8,7 @@ internal static class NetworkProtocol {
 
     public static string Hello() => $"HELLO|{ProtocolVersion}|{ModVersion}";
     public static string Welcome() => $"WELCOME|{ProtocolVersion}|{ModVersion}";
+    public static string Ready() => "READY";
     public static string Ping(long nonce) => $"PING|{nonce}";
     public static string Pong(long nonce) => $"PONG|{nonce}";
     public static string Frame(long authorityFrame) => $"FRAME|{authorityFrame}";
@@ -67,6 +68,9 @@ internal static class NetworkProtocol {
             && protocol == ProtocolVersion
             && string.Equals(parts[2], ModVersion, StringComparison.Ordinal);
     }
+
+    public static bool IsReady(string line)
+        => string.Equals(line, "READY", StringComparison.Ordinal);
 
     public static bool TryReadPing(string line, out long nonce) => TryReadNonce(line, "PING", out nonce);
     public static bool TryReadPong(string line, out long nonce) => TryReadNonce(line, "PONG", out nonce);
