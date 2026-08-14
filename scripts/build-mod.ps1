@@ -88,7 +88,12 @@ if (-not (Test-CoiRoot $CoiRoot)) {
 
 $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
 if (-not $dotnet) {
-    throw ".NET SDK was not found. Install .NET 8 SDK (or newer) and reopen PowerShell."
+    throw ".NET SDK was not found. Install the .NET 8 SDK and reopen the terminal. With WinGet: winget install Microsoft.DotNet.SDK.8"
+}
+
+$sdkList = @(& dotnet --list-sdks 2>$null)
+if ($LASTEXITCODE -ne 0 -or $sdkList.Count -eq 0) {
+    throw "The dotnet launcher is installed, but no .NET SDK is installed. Install .NET 8 SDK, reopen the terminal, then run this script again. With WinGet: winget install Microsoft.DotNet.SDK.8"
 }
 
 $env:COI_ROOT = (Resolve-Path $CoiRoot).Path
@@ -96,7 +101,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $project = Join-Path $repoRoot "src\CoiCoop\CoiCoop.csproj"
 
 Write-Host "COI_ROOT: $env:COI_ROOT"
-Write-Host "dotnet: $(& dotnet --version)"
+Write-Host "dotnet SDK: $(& dotnet --version)"
 Write-Host "Building COI-Coop ($Configuration)..."
 
 & dotnet build $project -c $Configuration
