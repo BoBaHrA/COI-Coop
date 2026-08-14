@@ -87,7 +87,7 @@ internal sealed class PersistentCommandSession : IDisposable {
 
         m_outgoing.Enqueue(NetworkProtocol.Commit(
             envelope.AuthoritySequence,
-            envelope.OriginClientId,
+            envelope.ClientId,
             envelope.ClientCommandId,
             envelope.Payload));
 
@@ -268,7 +268,7 @@ internal sealed class PersistentCommandSession : IDisposable {
         // The host must inspect/replay the remote command on the simulation thread.
         m_incoming.Enqueue(new ReceivedAuthorityCommand(
             envelope.AuthoritySequence,
-            envelope.OriginClientId,
+            envelope.ClientId,
             envelope.ClientCommandId,
             envelope.Payload));
 
@@ -276,7 +276,7 @@ internal sealed class PersistentCommandSession : IDisposable {
         // commands. Later lockstep mode will execute only COMMITs on both peers.
         m_outgoing.Enqueue(NetworkProtocol.Commit(
             envelope.AuthoritySequence,
-            envelope.OriginClientId,
+            envelope.ClientId,
             envelope.ClientCommandId,
             envelope.Payload));
 
