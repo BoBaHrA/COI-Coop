@@ -32,6 +32,7 @@ public sealed class CoiCoopMod : IMod {
         Manifest = manifest;
         JsonConfig = new ModJsonConfig(this);
         Log.Info("COI-Coop: constructed");
+        Log.Info("COI-Coop: Mafi.Core assembly version " + typeof(InputScheduler).Assembly.GetName().Version);
     }
 
     public void RegisterPrototypes(ProtoRegistrator registrator) {
@@ -144,8 +145,10 @@ public sealed class CoiCoopMod : IMod {
         try {
             if (mode == 1) {
                 Log.Info($"COI-Coop: HOST waiting on 127.0.0.1:{port}");
-                LocalTransportProbe.HostOnce(port);
-                Log.Info("COI-Coop: HOST handshake + ping completed successfully");
+                var completed = LocalTransportProbe.HostOnce(port);
+                Log.Info(completed
+                    ? "COI-Coop: HOST handshake + ping completed successfully"
+                    : "COI-Coop: HOST probe timed out waiting for a client");
                 return;
             }
 
