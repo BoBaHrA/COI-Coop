@@ -14,10 +14,20 @@ internal static class LocalTransportProbe {
             using (var stream = client.GetStream())
             using (var reader = new StreamReader(stream, Encoding.UTF8))
             using (var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) {
-                var line = reader.ReadLine();
-                writer.WriteLine(NetworkProtocol.IsCompatibleHello(line)
-                    ? NetworkProtocol.Welcome()
-                    : "REJECT|INCOMPATIBLE_PROTOCOL");
+                var hello = reader.ReadLine();
+                if (!NetworkProtocol.IsCompatibleHello(hello)) {
+                    writer.WriteLine("REJECT|INCOMPATIBLE_PROTOCOL");
+                    return;
+                }
+
+                writer.WriteLine(NetworkProtocol.Welcome());
+
+                var ping = reader.ReadLine();
+                if (!NetworkProtocol.TryReadPing(ping, out var nonce)) {
+                    throw new IOException("Expected PING after handshake.");
+                }
+
+                writer.WriteLine(NetworkProtocol.Pong(nonce));
             }
         }
         finally {
@@ -32,7 +42,14 @@ internal static class LocalTransportProbe {
             using (var reader = new StreamReader(stream, Encoding.UTF8))
             using (var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) {
                 writer.WriteLine(NetworkProtocol.Hello());
-                return NetworkProtocol.IsCompatibleWelcome(reader.ReadLine());
+                if (!NetworkProtocol.IsCompatibleWelcome(reader.ReadLine())) {
+                    return false;
+                }
+
+                const long nonce = 1;
+                writer.WriteLine(NetworkProtocol.Ping(nonce));
+                return NetworkProtocol.TryReadPong(reader.ReadLine(), out var returnedNonce)
+                    && returnedNonce == nonce;
             }
         }
     }
