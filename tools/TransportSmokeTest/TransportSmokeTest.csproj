@@ -9,5 +9,7 @@
   <ItemGroup>
     <Compile Include="..\..\src\CoiCoop\Networking\NetworkProtocol.cs" Link="Networking\NetworkProtocol.cs" />
     <Compile Include="..\..\src\CoiCoop\Networking\LocalTransportProbe.cs" Link="Networking\LocalTransportProbe.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\AuthorityCommandEnvelope.cs" Link="Networking\AuthorityCommandEnvelope.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\AuthorityCommandSequencer.cs" Link="Networking\AuthorityCommandSequencer.cs" />
   </ItemGroup>
 </Project>
