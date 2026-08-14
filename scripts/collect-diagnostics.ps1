@@ -1,5 +1,8 @@
 param(
-    [switch]$CopyToClipboard
+    [switch]$CopyToClipboard,
+
+    [ValidateRange(1, 10)]
+    [int]$LatestCount = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,27 +13,50 @@ if (-not (Test-Path $logDir)) {
     throw "Captain of Industry log directory was not found: $logDir"
 }
 
-$latest = Get-ChildItem $logDir -File |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
+$logs = @(
+    Get-ChildItem $logDir -File |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First $LatestCount
+)
 
-if (-not $latest) {
+if ($logs.Count -eq 0) {
     throw "No Captain of Industry log files were found in: $logDir"
 }
 
-$matches = Select-String -Path $latest.FullName -SimpleMatch "COI-Coop:" |
-    ForEach-Object { $_.Line }
+$sections = New-Object System.Collections.Generic.List[string]
+$foundAny = $false
 
-Write-Host "Log: $($latest.FullName)"
-Write-Host ""
+for ($i = 0; $i -lt $logs.Count; $i++) {
+    $log = $logs[$i]
+    $matches = @(
+        Select-String -Path $log.FullName -SimpleMatch "COI-Coop:" |
+            ForEach-Object { $_.Line }
+    )
 
-if (-not $matches) {
-    Write-Host "No COI-Coop lines found in the latest log."
-    exit 2
+    $header = "===== LOG $($i + 1)/$($logs.Count): $($log.Name) ====="
+    $sections.Add($header)
+
+    if ($matches.Count -eq 0) {
+        $sections.Add("No COI-Coop lines found in this log.")
+    }
+    else {
+        $foundAny = $true
+        foreach ($line in $matches) {
+            $sections.Add($line)
+        }
+    }
+
+    if ($i -lt $logs.Count - 1) {
+        $sections.Add("")
+    }
 }
 
-$text = $matches -join [Environment]::NewLine
+$text = $sections -join [Environment]::NewLine
 Write-Output $text
+
+if (-not $foundAny) {
+    exit 2
+}
 
 if ($CopyToClipboard) {
     Set-Clipboard -Value $text
