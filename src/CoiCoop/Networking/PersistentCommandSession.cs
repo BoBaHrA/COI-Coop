@@ -9,15 +9,12 @@ using System.Threading;
 namespace CoiCoop.Networking;
 
 /// <summary>
-/// First persistent two-peer transport for the co-op prototype.
+/// Persistent two-peer transport for the co-op prototype.
 ///
-/// The host is authoritative for command ordering. Client commands are submitted
-/// to the host, assigned an authority sequence, and broadcast back as COMMITs.
-/// Host-local commands are committed directly and delivered to both host and client.
-///
-/// This class deliberately knows nothing about Captain of Industry command types;
-/// payloads are opaque bytes. Game-side code decides when/how to deserialize and
-/// replay them on the simulation thread.
+/// The host is authoritative for both command ordering and authority-frame
+/// assignment. Commands accepted while host frame N is open are scheduled for
+/// N+1. A FRAME marker seals the previous frame on the wire, so the client knows
+/// that all COMMITs for that frame have already arrived before it executes them.
 /// </summary>
 internal sealed class PersistentCommandSession : IDisposable {
     private const int LoopSleepMs = 5;
@@ -34,6 +31,10 @@ internal sealed class PersistentCommandSession : IDisposable {
     private volatile bool m_stop;
     private volatile bool m_connected;
     private long m_nextLocalCommandId;
+    private long m_currentHostAuthorityFrame = -1;
+    private long m_latestAnnouncedAuthorityFrame = -1;
+    private long m_peerProgressFrame = -1;
+    private long m_peerProgressSequence = -1;
     private TcpListener m_listener;
     private TcpClient m_client;
 
@@ -46,6 +47,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     public bool IsHost => m_isHost;
     public bool IsConnected => m_connected;
     public string LocalClientId => m_isHost ? "host" : "client";
+    public long LatestAnnouncedAuthorityFrame => Interlocked.Read(ref m_latestAnnouncedAuthorityFrame);
 
     public void Start() {
         if (m_thread != null) {
@@ -57,6 +59,68 @@ internal sealed class PersistentCommandSession : IDisposable {
             Name = m_isHost ? "COI-Coop persistent host" : "COI-Coop persistent client"
         };
         m_thread.Start();
+    }
+
+    /// <summary>
+    /// Host-only. Seals the next authority frame. All commands assigned to this
+    /// frame were enqueued before the FRAME marker because assignment and sealing
+    /// use the same lock.
+    /// </summary>
+    public long AdvanceHostAuthorityFrame() {
+        if (!m_isHost) {
+            throw new InvalidOperationException("Only the host can advance the authority frame.");
+        }
+
+        if (!m_connected) {
+            return -1;
+        }
+
+        lock (m_authorityLock) {
+            var frame = m_currentHostAuthorityFrame + 1;
+            m_currentHostAuthorityFrame = frame;
+            m_outgoing.Enqueue(NetworkProtocol.Frame(frame));
+            Interlocked.Exchange(ref m_latestAnnouncedAuthorityFrame, frame);
+            return frame;
+        }
+    }
+
+    /// <summary>
+    /// Client-side barrier. FRAME is received only after all COMMITs for that
+    /// authority frame were read from the same ordered TCP stream.
+    /// </summary>
+    public bool WaitForAuthorityFrame(long authorityFrame, int timeoutMs) {
+        if (m_isHost) {
+            return Interlocked.Read(ref m_currentHostAuthorityFrame) >= authorityFrame;
+        }
+
+        var started = Environment.TickCount;
+        while (!m_stop && m_connected) {
+            if (Interlocked.Read(ref m_latestAnnouncedAuthorityFrame) >= authorityFrame) {
+                return true;
+            }
+
+            if (unchecked(Environment.TickCount - started) >= timeoutMs) {
+                return false;
+            }
+
+            Thread.Sleep(1);
+        }
+
+        return false;
+    }
+
+    public void ReportProgress(long authorityFrame, long appliedThroughSequence) {
+        if (!m_connected) {
+            return;
+        }
+
+        m_outgoing.Enqueue(NetworkProtocol.Progress(authorityFrame, appliedThroughSequence));
+    }
+
+    public bool TryGetPeerProgress(out long authorityFrame, out long appliedThroughSequence) {
+        authorityFrame = Interlocked.Read(ref m_peerProgressFrame);
+        appliedThroughSequence = Interlocked.Read(ref m_peerProgressSequence);
+        return authorityFrame >= 0;
     }
 
     public bool SubmitLocalCommand(byte[] payload) {
@@ -81,7 +145,9 @@ internal sealed class PersistentCommandSession : IDisposable {
         }
 
         AuthorityCommandEnvelope envelope;
+        long authorityFrame;
         lock (m_authorityLock) {
+            authorityFrame = m_currentHostAuthorityFrame + 1;
             if (!m_sequencer.TryAccept(
                     "host",
                     clientCommandId,
@@ -92,17 +158,16 @@ internal sealed class PersistentCommandSession : IDisposable {
                 return false;
             }
 
-            // Host-local input must pass through the same authority stream as
-            // client input. Queue local replay and remote broadcast while still
-            // holding the sequencing lock so sequence and queue order cannot race.
             m_incoming.Enqueue(new ReceivedAuthorityCommand(
                 envelope.AuthoritySequence,
+                authorityFrame,
                 envelope.ClientId,
                 envelope.ClientCommandId,
                 envelope.Payload));
 
             m_outgoing.Enqueue(NetworkProtocol.Commit(
                 envelope.AuthoritySequence,
+                authorityFrame,
                 envelope.ClientId,
                 envelope.ClientCommandId,
                 envelope.Payload));
@@ -110,6 +175,7 @@ internal sealed class PersistentCommandSession : IDisposable {
 
         m_log?.Invoke(
             "HOST queued COMMIT seq=" + envelope.AuthoritySequence
+            + " frame=" + authorityFrame
             + " origin=host id=" + clientCommandId
             + " bytes=" + payload.Length);
         return true;
@@ -254,6 +320,22 @@ internal sealed class PersistentCommandSession : IDisposable {
             return;
         }
 
+        long progressFrame;
+        long progressSequence;
+        if (NetworkProtocol.TryReadProgress(line, out progressFrame, out progressSequence)) {
+            Interlocked.Exchange(ref m_peerProgressFrame, progressFrame);
+            Interlocked.Exchange(ref m_peerProgressSequence, progressSequence);
+            return;
+        }
+
+        if (!m_isHost) {
+            long frame;
+            if (NetworkProtocol.TryReadFrame(line, out frame)) {
+                Interlocked.Exchange(ref m_latestAnnouncedAuthorityFrame, frame);
+                return;
+            }
+        }
+
         if (m_isHost) {
             HandleHostLine(line);
         }
@@ -269,7 +351,9 @@ internal sealed class PersistentCommandSession : IDisposable {
         }
 
         AuthorityCommandEnvelope envelope;
+        long authorityFrame;
         lock (m_authorityLock) {
+            authorityFrame = m_currentHostAuthorityFrame + 1;
             if (!m_sequencer.TryAccept(
                     "client",
                     clientCommandId,
@@ -281,16 +365,16 @@ internal sealed class PersistentCommandSession : IDisposable {
                 return;
             }
 
-            // Keep host replay order and wire COMMIT order identical to the
-            // authority sequence assigned above.
             m_incoming.Enqueue(new ReceivedAuthorityCommand(
                 envelope.AuthoritySequence,
+                authorityFrame,
                 envelope.ClientId,
                 envelope.ClientCommandId,
                 envelope.Payload));
 
             m_outgoing.Enqueue(NetworkProtocol.Commit(
                 envelope.AuthoritySequence,
+                authorityFrame,
                 envelope.ClientId,
                 envelope.ClientCommandId,
                 envelope.Payload));
@@ -298,29 +382,38 @@ internal sealed class PersistentCommandSession : IDisposable {
 
         m_log?.Invoke(
             "HOST accepted SUBMIT -> COMMIT seq=" + envelope.AuthoritySequence
+            + " frame=" + authorityFrame
             + " id=" + clientCommandId
             + " bytes=" + payload.Length);
     }
 
     private void HandleClientLine(string line) {
+        long authoritySequence;
+        long authorityFrame;
+        string originClientId;
+        long clientCommandId;
+        byte[] payload;
         if (!NetworkProtocol.TryReadCommit(
                 line,
-                out var authoritySequence,
-                out var originClientId,
-                out var clientCommandId,
-                out var payload)) {
+                out authoritySequence,
+                out authorityFrame,
+                out originClientId,
+                out clientCommandId,
+                out payload)) {
             m_log?.Invoke("CLIENT ignored malformed message");
             return;
         }
 
         m_incoming.Enqueue(new ReceivedAuthorityCommand(
             authoritySequence,
+            authorityFrame,
             originClientId,
             clientCommandId,
             payload));
 
         m_log?.Invoke(
             "CLIENT received COMMIT seq=" + authoritySequence
+            + " frame=" + authorityFrame
             + " origin=" + originClientId
             + " id=" + clientCommandId
             + " bytes=" + payload.Length);
@@ -328,6 +421,11 @@ internal sealed class PersistentCommandSession : IDisposable {
 
     private void SetConnected() {
         m_connected = true;
+        Interlocked.Exchange(ref m_peerProgressFrame, -1);
+        Interlocked.Exchange(ref m_peerProgressSequence, -1);
+        if (!m_isHost) {
+            Interlocked.Exchange(ref m_latestAnnouncedAuthorityFrame, -1);
+        }
         m_log?.Invoke(m_isHost ? "HOST session connected" : "CLIENT session connected");
     }
 
