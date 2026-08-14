@@ -30,6 +30,8 @@ internal sealed class PersistentCommandSession : IDisposable {
     private Thread m_thread;
     private volatile bool m_stop;
     private volatile bool m_connected;
+    private volatile bool m_localGameplayReady;
+    private volatile bool m_peerGameplayReady;
     private long m_nextLocalCommandId;
     private long m_currentHostAuthorityFrame = -1;
     private long m_latestAnnouncedAuthorityFrame = -1;
@@ -46,6 +48,8 @@ internal sealed class PersistentCommandSession : IDisposable {
 
     public bool IsHost => m_isHost;
     public bool IsConnected => m_connected;
+    public bool IsGameplayReady => m_localGameplayReady;
+    public bool PeerGameplayReady => m_peerGameplayReady;
     public string LocalClientId => m_isHost ? "host" : "client";
     public long LatestAnnouncedAuthorityFrame => Interlocked.Read(ref m_latestAnnouncedAuthorityFrame);
 
@@ -62,6 +66,23 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     /// <summary>
+    /// Called from the first outer simulation batch after the save is actually
+    /// ready. The client sends READY so the host cannot start frame 0 while the
+    /// second process is still loading the world.
+    /// </summary>
+    public void MarkGameplayReady() {
+        if (!m_connected || m_localGameplayReady) {
+            return;
+        }
+
+        m_localGameplayReady = true;
+        if (!m_isHost) {
+            m_outgoing.Enqueue(NetworkProtocol.Ready());
+            m_log?.Invoke("CLIENT gameplay READY queued");
+        }
+    }
+
+    /// <summary>
     /// Host-only. Seals the next authority frame. All commands assigned to this
     /// frame were enqueued before the FRAME marker because assignment and sealing
     /// use the same lock.
@@ -71,7 +92,7 @@ internal sealed class PersistentCommandSession : IDisposable {
             throw new InvalidOperationException("Only the host can advance the authority frame.");
         }
 
-        if (!m_connected) {
+        if (!m_connected || !m_localGameplayReady || !m_peerGameplayReady) {
             return -1;
         }
 
@@ -110,7 +131,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     public void ReportProgress(long authorityFrame, long appliedThroughSequence) {
-        if (!m_connected) {
+        if (!m_connected || !m_localGameplayReady) {
             return;
         }
 
@@ -132,7 +153,7 @@ internal sealed class PersistentCommandSession : IDisposable {
         if (payload == null) throw new ArgumentNullException(nameof(payload));
 
         clientCommandId = -1;
-        if (!m_connected) {
+        if (!m_connected || !m_localGameplayReady) {
             return false;
         }
 
@@ -320,6 +341,14 @@ internal sealed class PersistentCommandSession : IDisposable {
             return;
         }
 
+        if (NetworkProtocol.IsReady(line)) {
+            if (m_isHost) {
+                m_peerGameplayReady = true;
+                m_log?.Invoke("HOST received client gameplay READY");
+            }
+            return;
+        }
+
         long progressFrame;
         long progressSequence;
         if (NetworkProtocol.TryReadProgress(line, out progressFrame, out progressSequence)) {
@@ -421,6 +450,8 @@ internal sealed class PersistentCommandSession : IDisposable {
 
     private void SetConnected() {
         m_connected = true;
+        m_localGameplayReady = false;
+        m_peerGameplayReady = false;
         Interlocked.Exchange(ref m_peerProgressFrame, -1);
         Interlocked.Exchange(ref m_peerProgressSequence, -1);
         if (!m_isHost) {
@@ -434,6 +465,8 @@ internal sealed class PersistentCommandSession : IDisposable {
             m_log?.Invoke(m_isHost ? "HOST session disconnected" : "CLIENT session disconnected");
         }
         m_connected = false;
+        m_localGameplayReady = false;
+        m_peerGameplayReady = false;
 
         while (m_outgoing.TryDequeue(out _)) {
         }
