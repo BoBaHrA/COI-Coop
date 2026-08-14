@@ -5,6 +5,7 @@
   "description_short": "Experimental co-op transport foundation. Local TCP is used only when enabled.",
   "authors": "BoBaHrA",
   "primary_dlls": [ "CoiCoop.dll" ],
+  "primary_mod_class_name": "CoiCoop.CoiCoopMod",
   "non_locking_dll_load": true,
   "can_add_to_saved_game": true,
   "can_remove_from_saved_game": true
