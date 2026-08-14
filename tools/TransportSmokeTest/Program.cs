@@ -128,32 +128,40 @@ static int TestPersistentCommandSession() {
         return 21;
     }
 
-    if (!TryWaitForCommand(client, out var hostCommit) || hostCommit == null) {
-        Console.Error.WriteLine("FAIL: client did not receive host authority COMMIT.");
+    if (!TryWaitForCommand(host, out var hostLocalCommit) || hostLocalCommit == null) {
+        Console.Error.WriteLine("FAIL: host did not receive its own authority COMMIT for replay.");
         return 22;
     }
 
-    if (hostCommit.AuthoritySequence != 0
-        || hostCommit.OriginClientId != "host"
-        || !hostCommit.Payload.SequenceEqual(hostPayload)) {
-        Console.Error.WriteLine("FAIL: host COMMIT envelope/payload was corrupted.");
+    if (!TryWaitForCommand(client, out var hostCommit) || hostCommit == null) {
+        Console.Error.WriteLine("FAIL: client did not receive host authority COMMIT.");
         return 23;
+    }
+
+    if (hostLocalCommit.AuthoritySequence != 0
+        || hostCommit.AuthoritySequence != 0
+        || hostLocalCommit.OriginClientId != "host"
+        || hostCommit.OriginClientId != "host"
+        || !hostLocalCommit.Payload.SequenceEqual(hostPayload)
+        || !hostCommit.Payload.SequenceEqual(hostPayload)) {
+        Console.Error.WriteLine("FAIL: host-local COMMIT was not delivered identically to both peers.");
+        return 24;
     }
 
     var clientPayload = new byte[] { 99, 88, 77 };
     if (!client.SubmitLocalCommand(clientPayload)) {
         Console.Error.WriteLine("FAIL: client local command was not accepted for transport.");
-        return 24;
+        return 25;
     }
 
     if (!TryWaitForCommand(host, out var hostReceivedClient) || hostReceivedClient == null) {
         Console.Error.WriteLine("FAIL: host did not receive/authorize client SUBMIT.");
-        return 25;
+        return 26;
     }
 
     if (!TryWaitForCommand(client, out var clientEchoCommit) || clientEchoCommit == null) {
         Console.Error.WriteLine("FAIL: client did not receive authority COMMIT for its own SUBMIT.");
-        return 26;
+        return 27;
     }
 
     if (hostReceivedClient.AuthoritySequence != 1
@@ -163,10 +171,10 @@ static int TestPersistentCommandSession() {
         || !hostReceivedClient.Payload.SequenceEqual(clientPayload)
         || !clientEchoCommit.Payload.SequenceEqual(clientPayload)) {
         Console.Error.WriteLine("FAIL: client SUBMIT was not converted to one consistent authority COMMIT.");
-        return 27;
+        return 28;
     }
 
-    Console.WriteLine($"PASS: persistent command session transported host/client payloads with authority order on 127.0.0.1:{port}");
+    Console.WriteLine($"PASS: persistent command session delivered the same authority stream to host/client on 127.0.0.1:{port}");
     return 0;
 }
 
