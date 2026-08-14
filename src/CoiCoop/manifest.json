@@ -1,0 +1,6 @@
+{
+  "id": "CoiCoop",
+  "version": "0.0.1",
+  "primary_dlls": [ "CoiCoop.dll" ],
+  "non_locking_dll_load": true
+}
