@@ -252,7 +252,7 @@ public sealed class CoiCoopMod : IMod {
             var payloads = new List<byte[]>(captured.Count);
             foreach (var command in captured) {
                 byte[] payload;
-                string error;
+                string error = "round-trip probe is unavailable";
                 if (m_roundTripProbe == null
                     || !m_roundTripProbe.TrySerialize(command, out payload, out error)) {
                     HaltAuthoritativeReplay(
