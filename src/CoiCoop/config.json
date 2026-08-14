@@ -13,6 +13,10 @@
     "max": 65535,
     "is_integer": true
   },
+  "experimental_authoritative_replay": {
+    "default": false,
+    "description": "Dangerous development gate. When enabled with network mode 1/2, local pending commands are removed and only host-authorized COMMIT commands are inserted back into InputScheduler. Can also be overridden with COI_COOP_REPLAY=1."
+  },
   "trace_commands": {
     "default": true,
     "description": "Development option: log each processed player input command. Disable after compatibility testing."
@@ -23,6 +27,6 @@
   },
   "probe_preprocess_passthrough": {
     "default": true,
-    "description": "Development option: intercept the pending InputScheduler queue before processing and restore the exact same command objects in the exact same order."
+    "description": "Development option: intercept the pending InputScheduler queue before processing and restore the exact same command objects in the exact same order when authoritative replay is disabled."
   }
 }
