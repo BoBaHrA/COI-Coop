@@ -36,6 +36,7 @@ public sealed class CoiCoopMod : IMod {
     private readonly HashSet<string> m_preprocessSeenTypes = new HashSet<string>(StringComparer.Ordinal);
     private readonly HashSet<string> m_replayBypassSeenTypes = new HashSet<string>(StringComparer.Ordinal);
     private readonly List<ReplayMarker> m_replayMarkers = new List<ReplayMarker>();
+    private readonly Dictionary<long, IInputCommand> m_pendingLocalReplay = new Dictionary<long, IInputCommand>();
     private bool m_preprocessPassthroughConfirmed;
     private bool m_preprocessFailureLogged;
     private bool m_authoritativeReplayEnabled;
@@ -263,21 +264,35 @@ public sealed class CoiCoopMod : IMod {
             }
 
             for (var i = 0; i < captured.Count; i++) {
-                if (m_networkSession == null || !m_networkSession.SubmitLocalCommand(payloads[i])) {
+                long localCommandId;
+                if (m_networkSession == null
+                    || !m_networkSession.SubmitLocalCommand(payloads[i], out localCommandId)) {
                     HaltAuthoritativeReplay(
                         "network submit failed for local command " + captured[i].GetType().FullName);
                     return;
                 }
 
+                if (m_pendingLocalReplay.ContainsKey(localCommandId)) {
+                    HaltAuthoritativeReplay("duplicate local command id " + localCommandId);
+                    return;
+                }
+
+                // Keep the exact originating command object alive until its
+                // authority COMMIT comes back. Some COI UI tools keep identity-
+                // based state/callbacks on the original command instance. The
+                // remote peer still executes a deserialized clone.
+                m_pendingLocalReplay.Add(localCommandId, captured[i]);
+
                 Log.Info(
-                    "COI-Coop: REPLAY SUBMIT type=" + captured[i].GetType().FullName
+                    "COI-Coop: REPLAY SUBMIT localId=" + localCommandId
+                    + " type=" + captured[i].GetType().FullName
                     + " bytes=" + payloads[i].Length);
             }
         }
 
-        // Only authority COMMITs are put back into the scheduler. Local originals
-        // stay removed, preventing self-duplication and ensuring both peers execute
-        // the same serialized command objects in host-assigned order.
+        // Only authority COMMITs are put back into the scheduler. On the command's
+        // originating peer we restore the exact local object; on the other peer we
+        // replay the deserialized clone. Both still follow the same authority order.
         DrainReceivedNetworkCommands(commands);
     }
 
@@ -313,9 +328,9 @@ public sealed class CoiCoopMod : IMod {
 
         ReceivedAuthorityCommand received;
         while (m_networkSession.TryDequeueReceived(out received)) {
-            IInputCommand command;
+            IInputCommand decodedCommand;
             string error;
-            if (!m_roundTripProbe.TryDeserialize(received.Payload, out command, out error)) {
+            if (!m_roundTripProbe.TryDeserialize(received.Payload, out decodedCommand, out error)) {
                 Log.Info(
                     "COI-Coop: NETWORK RX FAIL seq=" + received.AuthoritySequence
                     + " origin=" + received.OriginClientId
@@ -331,7 +346,7 @@ public sealed class CoiCoopMod : IMod {
                     "COI-Coop: NETWORK RX OK seq=" + received.AuthoritySequence
                     + " origin=" + received.OriginClientId
                     + " id=" + received.ClientCommandId
-                    + " type=" + command.GetType().FullName
+                    + " type=" + decodedCommand.GetType().FullName
                     + " bytes=" + received.Payload.Length
                     + " replay=OFF");
                 continue;
@@ -351,16 +366,38 @@ public sealed class CoiCoopMod : IMod {
                 continue;
             }
 
-            replayTarget.Add(command);
+            var replayCommand = decodedCommand;
+            var usedLocalOriginal = false;
+            if (string.Equals(
+                    received.OriginClientId,
+                    m_networkSession.LocalClientId,
+                    StringComparison.Ordinal)) {
+
+                IInputCommand localOriginal;
+                if (!m_pendingLocalReplay.TryGetValue(received.ClientCommandId, out localOriginal)) {
+                    HaltAuthoritativeReplay(
+                        "local authority COMMIT has no pending original: id="
+                        + received.ClientCommandId);
+                    continue;
+                }
+
+                replayCommand = localOriginal;
+                m_pendingLocalReplay.Remove(received.ClientCommandId);
+                usedLocalOriginal = true;
+            }
+
+            replayTarget.Add(replayCommand);
             m_replayMarkers.Add(new ReplayMarker(
-                command,
+                replayCommand,
                 received.AuthoritySequence,
                 received.OriginClientId));
 
             Log.Info(
                 "COI-Coop: REPLAY QUEUED seq=" + received.AuthoritySequence
                 + " origin=" + received.OriginClientId
-                + " type=" + command.GetType().FullName
+                + " id=" + received.ClientCommandId
+                + " type=" + replayCommand.GetType().FullName
+                + " localOriginal=" + (usedLocalOriginal ? "YES" : "NO")
                 + " bytes=" + received.Payload.Length);
 
             m_nextExpectedAuthoritySequence++;
@@ -525,6 +562,7 @@ public sealed class CoiCoopMod : IMod {
         m_preprocessSeenTypes.Clear();
         m_replayBypassSeenTypes.Clear();
         m_replayMarkers.Clear();
+        m_pendingLocalReplay.Clear();
         m_preprocessPassthroughConfirmed = false;
         m_preprocessFailureLogged = false;
         m_authoritativeReplayEnabled = false;
