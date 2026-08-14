@@ -9,11 +9,12 @@ Development is currently on `dev/network-foundation`.
 ## Current status
 
 - Native COI mod manifest and .NET Framework 4.8 project.
-- `IMod` lifecycle entry point.
+- Explicit `CoiCoop.CoiCoopMod` entry point using the `IMod` lifecycle.
 - Local TCP protocol with version handshake and bidirectional PING/PONG.
 - Standalone transport smoke test running in GitHub Actions.
 - Update 4.2 compatibility probe for `InputScheduler.m_commandsToProcess`.
 - Development command observer for processed `IInputCommand` types.
+- Windows helper scripts for automatic build/deploy and filtered diagnostic collection.
 
 The transport is intentionally restricted to `127.0.0.1` until the first in-game compatibility test succeeds.
 
