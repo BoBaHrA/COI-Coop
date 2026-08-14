@@ -45,6 +45,7 @@ internal sealed class PersistentCommandSession : IDisposable {
 
     public bool IsHost => m_isHost;
     public bool IsConnected => m_connected;
+    public string LocalClientId => m_isHost ? "host" : "client";
 
     public void Start() {
         if (m_thread != null) {
@@ -59,12 +60,19 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     public bool SubmitLocalCommand(byte[] payload) {
+        long ignoredClientCommandId;
+        return SubmitLocalCommand(payload, out ignoredClientCommandId);
+    }
+
+    public bool SubmitLocalCommand(byte[] payload, out long clientCommandId) {
         if (payload == null) throw new ArgumentNullException(nameof(payload));
+
+        clientCommandId = -1;
         if (!m_connected) {
             return false;
         }
 
-        var clientCommandId = Interlocked.Increment(ref m_nextLocalCommandId) - 1;
+        clientCommandId = Interlocked.Increment(ref m_nextLocalCommandId) - 1;
 
         if (!m_isHost) {
             m_outgoing.Enqueue(NetworkProtocol.Submit(clientCommandId, payload));
