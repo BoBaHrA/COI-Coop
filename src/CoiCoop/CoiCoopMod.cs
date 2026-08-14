@@ -1,22 +1,117 @@
 using System;
+using System.Reflection;
 using System.Threading;
 using CoiCoop.Networking;
 using Mafi;
 using Mafi.Collections;
 using Mafi.Core;
+using Mafi.Core.Input;
 using Mafi.Core.Mods;
+using Mafi.Core.Prototypes;
+using Mafi.Core.Simulation;
 
 namespace CoiCoop;
 
-public sealed class CoiCoopMod : DataOnlyMod {
-    private static int s_probeStarted;
+public sealed class CoiCoopMod : IMod {
+    private DependencyResolver m_resolver;
+    private InputScheduler m_scheduler;
+    private ISimLoopEvents m_simLoop;
+    private bool m_gameHooksAttached;
+    private int m_transportProbeStarted;
 
-    public CoiCoopMod(ModManifest manifest) : base(manifest) {
+    public ModManifest Manifest { get; }
+
+    public bool IsUiOnly => false;
+
+    [Obsolete("Use JsonConfig instead.")]
+    public Option<IConfig> ModConfig { get; set; }
+
+    public ModJsonConfig JsonConfig { get; }
+
+    public CoiCoopMod(ModManifest manifest) {
+        Manifest = manifest;
+        JsonConfig = new ModJsonConfig(this);
         Log.Info("COI-Coop: constructed");
     }
 
-    public override void RegisterPrototypes(ProtoRegistrator registrator) {
-        if (Interlocked.Exchange(ref s_probeStarted, 1) != 0) {
+    public void RegisterPrototypes(ProtoRegistrator registrator) {
+    }
+
+    public void RegisterDependencies(DependencyResolverBuilder depBuilder, ProtosDb protosDb, bool gameWasLoaded) {
+    }
+
+    public void EarlyInit(DependencyResolver resolver) {
+    }
+
+    public void Initialize(DependencyResolver resolver, bool gameWasLoaded) {
+        m_resolver = resolver;
+        Log.Info("COI-Coop: Initialize; gameWasLoaded=" + gameWasLoaded);
+
+        InputScheduler scheduler;
+        if (resolver.TryGetResolvedDependency<InputScheduler>(out scheduler)) {
+            m_scheduler = scheduler;
+        }
+
+        ISimLoopEvents simLoop;
+        if (resolver.TryGetResolvedDependency<ISimLoopEvents>(out simLoop)) {
+            m_simLoop = simLoop;
+        }
+
+        TryAttachGameHooks();
+        if (!m_gameHooksAttached) {
+            resolver.ObjectInstantiated += OnObjectInstantiated;
+            Log.Info("COI-Coop: waiting for InputScheduler / ISimLoopEvents to be instantiated");
+        }
+
+        StartTransportProbe();
+    }
+
+    private void OnObjectInstantiated(object instance) {
+        if (instance is InputScheduler scheduler) {
+            m_scheduler = scheduler;
+        }
+
+        if (instance is ISimLoopEvents simLoop) {
+            m_simLoop = simLoop;
+        }
+
+        TryAttachGameHooks();
+        if (m_gameHooksAttached && m_resolver != null) {
+            m_resolver.ObjectInstantiated -= OnObjectInstantiated;
+        }
+    }
+
+    private void TryAttachGameHooks() {
+        if (m_gameHooksAttached || m_scheduler == null || m_simLoop == null) {
+            return;
+        }
+
+        var commandsField = typeof(InputScheduler).GetField(
+            "m_commandsToProcess",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        if (commandsField == null) {
+            Log.Info("COI-Coop: COMPATIBILITY FAIL - InputScheduler.m_commandsToProcess was not found. Game API changed.");
+            return;
+        }
+
+        m_scheduler.OnCommandProcessed.AddNonSaveable(this, OnCommandProcessed);
+        m_gameHooksAttached = true;
+
+        Log.Info("COI-Coop: COMPATIBILITY OK - InputScheduler command queue found");
+        Log.Info("COI-Coop: command observer attached");
+    }
+
+    private void OnCommandProcessed(IInputCommand command) {
+        if (!JsonConfig.GetBool("trace_commands")) {
+            return;
+        }
+
+        Log.Info("COI-Coop: INPUT " + command.GetType().FullName);
+    }
+
+    private void StartTransportProbe() {
+        if (Interlocked.Exchange(ref m_transportProbeStarted, 1) != 0) {
             return;
         }
 
@@ -70,6 +165,17 @@ public sealed class CoiCoopMod : DataOnlyMod {
         }
     }
 
-    public override void MigrateJsonConfig(VersionSlim savedVersion, Dict<string, object> savedValues) {
+    public void MigrateJsonConfig(VersionSlim savedVersion, Dict<string, object> savedValues) {
+    }
+
+    public void Dispose() {
+        if (m_resolver != null) {
+            m_resolver.ObjectInstantiated -= OnObjectInstantiated;
+        }
+
+        m_resolver = null;
+        m_scheduler = null;
+        m_simLoop = null;
+        m_gameHooksAttached = false;
     }
 }
