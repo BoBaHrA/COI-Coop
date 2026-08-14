@@ -12,5 +12,9 @@
     "min": 1024,
     "max": 65535,
     "is_integer": true
+  },
+  "trace_commands": {
+    "default": true,
+    "description": "Development option: log each processed player input command. Disable after compatibility testing."
   }
 }
