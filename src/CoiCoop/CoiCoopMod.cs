@@ -5,6 +5,7 @@ using CoiCoop.Networking;
 using Mafi;
 using Mafi.Collections;
 using Mafi.Core;
+using Mafi.Core.Game;
 using Mafi.Core.Input;
 using Mafi.Core.Mods;
 using Mafi.Core.Prototypes;
