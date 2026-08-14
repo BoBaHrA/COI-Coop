@@ -13,11 +13,11 @@ namespace CoiCoop.Networking;
 ///
 /// The host is authoritative for command ordering. Client commands are submitted
 /// to the host, assigned an authority sequence, and broadcast back as COMMITs.
-/// Host-local commands are committed directly and broadcast to the client.
+/// Host-local commands are committed directly and delivered to both host and client.
 ///
 /// This class deliberately knows nothing about Captain of Industry command types;
 /// payloads are opaque bytes. Game-side code decides when/how to deserialize and
-/// eventually replay them on the simulation thread.
+/// replay them on the simulation thread.
 /// </summary>
 internal sealed class PersistentCommandSession : IDisposable {
     private const int LoopSleepMs = 5;
@@ -83,13 +83,22 @@ internal sealed class PersistentCommandSession : IDisposable {
                     out envelope)) {
                 return false;
             }
-        }
 
-        m_outgoing.Enqueue(NetworkProtocol.Commit(
-            envelope.AuthoritySequence,
-            envelope.ClientId,
-            envelope.ClientCommandId,
-            envelope.Payload));
+            // Host-local input must pass through the same authority stream as
+            // client input. Queue local replay and remote broadcast while still
+            // holding the sequencing lock so sequence and queue order cannot race.
+            m_incoming.Enqueue(new ReceivedAuthorityCommand(
+                envelope.AuthoritySequence,
+                envelope.ClientId,
+                envelope.ClientCommandId,
+                envelope.Payload));
+
+            m_outgoing.Enqueue(NetworkProtocol.Commit(
+                envelope.AuthoritySequence,
+                envelope.ClientId,
+                envelope.ClientCommandId,
+                envelope.Payload));
+        }
 
         m_log?.Invoke(
             "HOST queued COMMIT seq=" + envelope.AuthoritySequence
@@ -263,22 +272,21 @@ internal sealed class PersistentCommandSession : IDisposable {
                 m_log?.Invoke("HOST ignored duplicate SUBMIT id=" + clientCommandId);
                 return;
             }
+
+            // Keep host replay order and wire COMMIT order identical to the
+            // authority sequence assigned above.
+            m_incoming.Enqueue(new ReceivedAuthorityCommand(
+                envelope.AuthoritySequence,
+                envelope.ClientId,
+                envelope.ClientCommandId,
+                envelope.Payload));
+
+            m_outgoing.Enqueue(NetworkProtocol.Commit(
+                envelope.AuthoritySequence,
+                envelope.ClientId,
+                envelope.ClientCommandId,
+                envelope.Payload));
         }
-
-        // The host must inspect/replay the remote command on the simulation thread.
-        m_incoming.Enqueue(new ReceivedAuthorityCommand(
-            envelope.AuthoritySequence,
-            envelope.ClientId,
-            envelope.ClientCommandId,
-            envelope.Payload));
-
-        // The client receives the same authority envelope, including its own
-        // commands. Later lockstep mode will execute only COMMITs on both peers.
-        m_outgoing.Enqueue(NetworkProtocol.Commit(
-            envelope.AuthoritySequence,
-            envelope.ClientId,
-            envelope.ClientCommandId,
-            envelope.Payload));
 
         m_log?.Invoke(
             "HOST accepted SUBMIT -> COMMIT seq=" + envelope.AuthoritySequence
