@@ -1,0 +1,16 @@
+{
+  "network_mode": {
+    "default": 0,
+    "description": "0 = off, 1 = host, 2 = client.",
+    "min": 0,
+    "max": 2,
+    "is_integer": true
+  },
+  "server_port": {
+    "default": 27015,
+    "description": "Port used by the prototype.",
+    "min": 1024,
+    "max": 65535,
+    "is_integer": true
+  }
+}
