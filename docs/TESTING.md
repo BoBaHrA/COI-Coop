@@ -1,112 +1,135 @@
 # COI-Coop prototype testing
 
-The current branch has two independent checks:
+The branch now has three useful test levels:
 
-1. a standalone TCP handshake/PING smoke test (already automated in GitHub Actions), and
-2. an in-game Update 4.2 compatibility probe that needs a real Captain of Industry installation.
+1. standalone transport/authority smoke tests in GitHub Actions;
+2. safe single-process command capture + serializer checks in a real game install;
+3. an explicitly gated two-process authoritative replay experiment.
 
-## 1. Build and deploy the mod
+## 1. Build and deploy
 
-From the repository root in PowerShell:
-
-```powershell
-.\scripts\build-mod.ps1
-```
-
-The script tries to locate Captain of Industry in Steam libraries automatically. You can also pass the path explicitly:
+From the repository root:
 
 ```powershell
-.\scripts\build-mod.ps1 -CoiRoot "D:\SteamLibrary\steamapps\common\Captain of Industry"
+scripts\build-mod.bat
 ```
 
-A successful build deploys these files to:
+The helper locates Steam libraries automatically and deploys the mod to:
 
 ```text
 %APPDATA%\Captain of Industry\Mods\CoiCoop
 ```
 
-## 2. Single-process game API compatibility test
+## 2. Safe single-process test
 
-Keep `network_mode = 0` for this test. Launch Captain of Industry normally, enable **COI Co-op Prototype**, and load an existing save.
+Keep `network_mode = 0`. The experimental replay gate defaults to `false`.
 
-Open the latest log in:
-
-```text
-%APPDATA%\Captain of Industry\Logs
-```
-
-Expected startup lines include:
+Expected startup lines:
 
 ```text
 COI-Coop: constructed
 COI-Coop: Mafi.Core assembly version ...
 COI-Coop: Initialize; gameWasLoaded=True
 COI-Coop: COMPATIBILITY OK - InputScheduler command queue found
+COI-Coop: pre-processing command hook attached
 COI-Coop: command observer attached
+COI-Coop: networking is disabled (mode 0)
 ```
 
-If the private command queue changed in Update 4.2, the log should instead contain:
+With the development probes enabled, normal player actions should produce lines such as:
 
 ```text
-COI-Coop: COMPATIBILITY FAIL - InputScheduler.m_commandsToProcess was not found. Game API changed.
-```
-
-With `trace_commands = true`, perform a few actions in the loaded world:
-
-- place one building,
-- place one transport segment,
-- demolish something,
-- change a building setting if convenient.
-
-The log should gain entries similar to:
-
-```text
+COI-Coop: PREPROCESS SEEN Mafi.Core....SomeCommand
 COI-Coop: INPUT Mafi.Core....SomeCommand
+COI-Coop: SERIALIZE OK type=Mafi.Core....SomeCommand bytes=...
 ```
 
-Those command names are the data we need for the first real synchronization experiment.
-
-After leaving the game, the easiest way to collect only relevant lines is:
+Diagnostics can be collected with:
 
 ```powershell
-.\scripts\collect-diagnostics.ps1 -CopyToClipboard
+scripts\collect-diagnostics.bat
 ```
 
-That finds the newest Captain of Industry log, filters `COI-Coop:` lines, prints them, and copies them to the clipboard.
+## 3. Persistent transport, replay OFF
 
-## 3. Two-process local network probe
+Environment variables override the shared mod config per process.
 
-Only after the single-process compatibility probe succeeds.
-
-Environment variables override `config.json` for one process only.
-
-Host terminal:
+Host:
 
 ```powershell
 $env:COI_COOP_MODE = "1"
 $env:COI_COOP_PORT = "27015"
-& "$env:COI_ROOT\Captain of Industry.exe"
+$env:COI_COOP_REPLAY = "0"
+& "<COI_ROOT>\Captain of Industry.exe"
 ```
 
-Client terminal:
+Client:
 
 ```powershell
 $env:COI_COOP_MODE = "2"
 $env:COI_COOP_PORT = "27015"
-& "$env:COI_ROOT\Captain of Industry.exe"
+$env:COI_COOP_REPLAY = "0"
+& "<COI_ROOT>\Captain of Industry.exe"
 ```
 
-Start the host first, then the client. The current host probe waits up to 30 seconds for a connection.
+Expected logs include `session connected`, `NETWORK TX`, and `NETWORK RX OK ... replay=OFF`.
 
-Expected log messages:
+## 4. First authoritative replay experiment
+
+This mode is intentionally opt-in and is not yet normal gameplay.
+
+Use a disposable copy of a save and keep both instances paused. Both instances must load the same starting save/state before any synchronized action is attempted. Do not test pause/speed changes yet.
+
+Host:
+
+```powershell
+$env:COI_COOP_MODE = "1"
+$env:COI_COOP_PORT = "27015"
+$env:COI_COOP_REPLAY = "1"
+& "<COI_ROOT>\Captain of Industry.exe"
+```
+
+Client:
+
+```powershell
+$env:COI_COOP_MODE = "2"
+$env:COI_COOP_PORT = "27015"
+$env:COI_COOP_REPLAY = "1"
+& "<COI_ROOT>\Captain of Industry.exe"
+```
+
+The replay gate blocks local player commands until the peer is connected. Once both logs show the session connected, make exactly one simple action first, preferably placing a basic building while paused.
+
+Expected host/client flow:
 
 ```text
-COI-Coop: HOST handshake + ping completed successfully
-COI-Coop: CLIENT handshake + ping completed successfully
+COI-Coop: EXPERIMENTAL AUTHORITATIVE REPLAY = ON
+COI-Coop: NET ... session connected
+COI-Coop: REPLAY SUBMIT type=...BatchCreateStaticEntitiesCmd bytes=...
+COI-Coop: REPLAY QUEUED seq=0 origin=... type=...BatchCreateStaticEntitiesCmd bytes=...
+COI-Coop: REPLAY APPLIED seq=0 origin=... type=...BatchCreateStaticEntitiesCmd
 ```
 
-The prototype intentionally binds to `127.0.0.1`. LAN/Internet support comes after the in-game integration points are verified.
+Both peers should receive and apply the same authority sequence.
 
-## What to send back after the first game test
+If any peer logs one of these, stop the experiment and reload the disposable save:
 
-Paste the output of `collect-diagnostics.ps1`. There is no need to send the entire game log unless the game throws an exception or the collector finds no `COI-Coop:` lines.
+```text
+COI-Coop: REPLAY HALT - ...
+COI-Coop: REPLAY BLOCKED - synchronized session is faulted ...
+COI-Coop: NETWORK RX FAIL ...
+```
+
+`REPLAY DERIVED/BYPASS` is diagnostic rather than an automatic failure. It identifies commands processed without an authority marker, which may be deterministic commands generated internally by the game after the pre-processing hook.
+
+## Current limitations of replay mode
+
+- loopback (`127.0.0.1`) only;
+- no automatic save transfer yet;
+- no simulation-frame barrier yet;
+- no reconnect/resync yet;
+- pause/speed are not yet treated as synchronized global state;
+- conflict policies exist as a foundation but are not yet mapped to real game command types;
+- authoritative state hashes/desync repair are not implemented yet.
+
+The first replay milestone is deliberately narrow: prove that one serialized building command can be host-authorized and executed on both instances from the same paused starting state.
