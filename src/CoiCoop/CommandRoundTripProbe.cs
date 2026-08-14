@@ -10,9 +10,8 @@ using Mafi.Serialization;
 namespace CoiCoop;
 
 /// <summary>
-/// Development-only probe that verifies whether a processed IInputCommand can be
-/// serialized to bytes and reconstructed with the game's own serialization stack.
-/// No reconstructed command is executed.
+/// Small adapter around the game's own command serialization stack. During the
+/// compatibility phase it is also used for round-trip verification.
 /// </summary>
 internal sealed class CommandRoundTripProbe {
     private readonly DependencyResolver m_resolver;
@@ -33,23 +32,53 @@ internal sealed class CommandRoundTripProbe {
         cloneType = null;
         error = null;
 
+        byte[] payload;
+        if (!TrySerialize(command, out payload, out error)) {
+            return false;
+        }
+
+        payloadLength = payload.Length;
+
+        IInputCommand clone;
+        if (!TryDeserialize(payload, out clone, out error)) {
+            return false;
+        }
+
+        if (clone == null) {
+            error = "deserializer returned null";
+            return false;
+        }
+
+        cloneType = clone.GetType().FullName;
+        if (clone.GetType() != command.GetType()) {
+            error = "round-trip type mismatch: " + command.GetType().FullName + " -> " + cloneType;
+            return false;
+        }
+
+        return true;
+    }
+
+    public bool TrySerialize(IInputCommand command, out byte[] payload, out string error) {
+        payload = null;
+        error = null;
+
         try {
-            var payload = Serialize(command);
-            payloadLength = payload.Length;
-
-            var clone = Deserialize(payload);
-            if (clone == null) {
-                error = "deserializer returned null";
-                return false;
-            }
-
-            cloneType = clone.GetType().FullName;
-            if (clone.GetType() != command.GetType()) {
-                error = "round-trip type mismatch: " + command.GetType().FullName + " -> " + cloneType;
-                return false;
-            }
-
+            payload = Serialize(command);
             return true;
+        }
+        catch (Exception ex) {
+            error = ex.GetType().Name + ": " + ex.Message;
+            return false;
+        }
+    }
+
+    public bool TryDeserialize(byte[] payload, out IInputCommand command, out string error) {
+        command = null;
+        error = null;
+
+        try {
+            command = Deserialize(payload);
+            return command != null;
         }
         catch (Exception ex) {
             error = ex.GetType().Name + ": " + ex.Message;
