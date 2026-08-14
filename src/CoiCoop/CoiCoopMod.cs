@@ -19,12 +19,13 @@ public sealed class CoiCoopMod : IMod {
     private InputScheduler m_scheduler;
     private ISimLoopEvents m_simLoop;
     private CommandRoundTripProbe m_roundTripProbe;
+    private PersistentCommandSession m_networkSession;
     private FieldInfo m_commandsToProcessField;
     private readonly HashSet<string> m_preprocessSeenTypes = new HashSet<string>(StringComparer.Ordinal);
     private bool m_preprocessPassthroughConfirmed;
     private bool m_preprocessFailureLogged;
     private bool m_gameHooksAttached;
-    private int m_transportProbeStarted;
+    private int m_networkStarted;
 
     public ModManifest Manifest { get; }
 
@@ -72,7 +73,7 @@ public sealed class CoiCoopMod : IMod {
             Log.Info("COI-Coop: waiting for InputScheduler / ISimLoopEvents to be instantiated");
         }
 
-        StartTransportProbe();
+        StartNetworking();
     }
 
     private void OnObjectInstantiated(object instance) {
@@ -115,6 +116,8 @@ public sealed class CoiCoopMod : IMod {
     }
 
     private void OnBeforeCommandProcessing() {
+        DrainReceivedNetworkCommands();
+
         if (!JsonConfig.GetBool("probe_preprocess_passthrough")
             || m_scheduler == null
             || m_commandsToProcessField == null) {
@@ -136,14 +139,18 @@ public sealed class CoiCoopMod : IMod {
             }
 
             // Dry-run for the future lockstep path. We take ownership of the queue,
-            // then restore the exact same command objects in the exact same order.
-            // No command is delayed, cloned, dropped, or executed by the mod here.
+            // optionally serialize/send the captured input, then restore the exact
+            // same command objects in the exact same order. Remote commands are NOT
+            // executed yet; received authority packets are decode-only diagnostics.
             var captured = new List<IInputCommand>(commands.Count);
             foreach (var command in commands) {
                 captured.Add(command);
             }
 
             commands.Clear();
+
+            SendCapturedCommands(captured);
+
             foreach (var command in captured) {
                 commands.Add(command);
             }
@@ -165,6 +172,58 @@ public sealed class CoiCoopMod : IMod {
                 m_preprocessFailureLogged = true;
                 Log.Info("COI-Coop: PREPROCESS FAIL - " + ex.GetType().Name + ": " + ex.Message);
             }
+        }
+    }
+
+    private void SendCapturedCommands(List<IInputCommand> captured) {
+        if (m_networkSession == null
+            || !m_networkSession.IsConnected
+            || m_roundTripProbe == null) {
+            return;
+        }
+
+        foreach (var command in captured) {
+            byte[] payload;
+            string error;
+            if (!m_roundTripProbe.TrySerialize(command, out payload, out error)) {
+                Log.Info(
+                    "COI-Coop: NETWORK TX FAIL type=" + command.GetType().FullName
+                    + " error=" + error);
+                continue;
+            }
+
+            if (m_networkSession.SubmitLocalCommand(payload)) {
+                Log.Info(
+                    "COI-Coop: NETWORK TX type=" + command.GetType().FullName
+                    + " bytes=" + payload.Length);
+            }
+        }
+    }
+
+    private void DrainReceivedNetworkCommands() {
+        if (m_networkSession == null || m_roundTripProbe == null) {
+            return;
+        }
+
+        ReceivedAuthorityCommand received;
+        while (m_networkSession.TryDequeueReceived(out received)) {
+            IInputCommand command;
+            string error;
+            if (!m_roundTripProbe.TryDeserialize(received.Payload, out command, out error)) {
+                Log.Info(
+                    "COI-Coop: NETWORK RX FAIL seq=" + received.AuthoritySequence
+                    + " origin=" + received.OriginClientId
+                    + " error=" + error);
+                continue;
+            }
+
+            Log.Info(
+                "COI-Coop: NETWORK RX OK seq=" + received.AuthoritySequence
+                + " origin=" + received.OriginClientId
+                + " id=" + received.ClientCommandId
+                + " type=" + command.GetType().FullName
+                + " bytes=" + received.Payload.Length
+                + " replay=OFF");
         }
     }
 
@@ -195,8 +254,8 @@ public sealed class CoiCoopMod : IMod {
         }
     }
 
-    private void StartTransportProbe() {
-        if (Interlocked.Exchange(ref m_transportProbeStarted, 1) != 0) {
+    private void StartNetworking() {
+        if (Interlocked.Exchange(ref m_networkStarted, 1) != 0) {
             return;
         }
 
@@ -213,43 +272,28 @@ public sealed class CoiCoopMod : IMod {
             return;
         }
 
-        var thread = new Thread(() => RunTransportProbe(mode, port)) {
-            IsBackground = true,
-            Name = "COI-Coop transport probe"
-        };
-        thread.Start();
+        if (mode != 1 && mode != 2) {
+            Log.Info($"COI-Coop: unsupported network mode: {mode}");
+            return;
+        }
+
+        var isHost = mode == 1;
+        m_networkSession = new PersistentCommandSession(
+            isHost,
+            port,
+            message => Log.Info("COI-Coop: NET " + message));
+        m_networkSession.Start();
+
+        Log.Info(
+            isHost
+                ? $"COI-Coop: persistent HOST session starting on 127.0.0.1:{port}"
+                : $"COI-Coop: persistent CLIENT session connecting to 127.0.0.1:{port}");
+        Log.Info("COI-Coop: network command replay is OFF; received commands are decode-only for this milestone");
     }
 
     private static int ReadEnvironmentInt(string name, int fallback) {
         var value = Environment.GetEnvironmentVariable(name);
         return int.TryParse(value, out var parsed) ? parsed : fallback;
-    }
-
-    private static void RunTransportProbe(int mode, int port) {
-        try {
-            if (mode == 1) {
-                Log.Info($"COI-Coop: HOST waiting on 127.0.0.1:{port}");
-                var completed = LocalTransportProbe.HostOnce(port);
-                Log.Info(completed
-                    ? "COI-Coop: HOST handshake + ping completed successfully"
-                    : "COI-Coop: HOST probe timed out waiting for a client");
-                return;
-            }
-
-            if (mode == 2) {
-                Log.Info($"COI-Coop: CLIENT connecting to 127.0.0.1:{port}");
-                var connected = LocalTransportProbe.ClientOnce(port);
-                Log.Info(connected
-                    ? "COI-Coop: CLIENT handshake + ping completed successfully"
-                    : "COI-Coop: CLIENT handshake was rejected");
-                return;
-            }
-
-            Log.Info($"COI-Coop: unsupported network mode: {mode}");
-        }
-        catch (Exception ex) {
-            Log.Info("COI-Coop: transport probe failed: " + ex);
-        }
     }
 
     public void MigrateJsonConfig(VersionSlim savedVersion, Dict<string, object> savedValues) {
@@ -260,6 +304,8 @@ public sealed class CoiCoopMod : IMod {
             m_resolver.ObjectInstantiated -= OnObjectInstantiated;
         }
 
+        m_networkSession?.Dispose();
+        m_networkSession = null;
         m_resolver = null;
         m_scheduler = null;
         m_simLoop = null;
