@@ -4,7 +4,13 @@
     <OutputType>Library</OutputType>
     <LangVersion>latest</LangVersion>
     <AssemblyName>CoiCoop</AssemblyName>
+    <COI_MODS>$(APPDATA)\Captain of Industry\Mods</COI_MODS>
+    <DeployToModsFolder>true</DeployToModsFolder>
   </PropertyGroup>
+
+  <Target Name="ValidateCoiRoot" BeforeTargets="ResolveReferences">
+    <Error Condition="'$(COI_ROOT)' == ''" Text="Set COI_ROOT to the Captain of Industry installation directory." />
+  </Target>
 
   <ItemGroup>
     <Reference Include="Mafi">
@@ -14,4 +20,11 @@
       <HintPath>$(COI_ROOT)\Captain of Industry_Data\Managed\Mafi.Core.dll</HintPath>
     </Reference>
   </ItemGroup>
+
+  <Target Name="DeployMod" AfterTargets="Build" Condition="'$(DeployToModsFolder)' == 'true'">
+    <MakeDir Directories="$(COI_MODS)\CoiCoop" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(COI_MODS)\CoiCoop" />
+    <Copy SourceFiles="$(ProjectDir)manifest.json" DestinationFolder="$(COI_MODS)\CoiCoop" />
+    <Copy SourceFiles="$(ProjectDir)config.json" DestinationFolder="$(COI_MODS)\CoiCoop" />
+  </Target>
 </Project>
