@@ -122,59 +122,98 @@ static int TestPersistentCommandSession() {
         return 20;
     }
 
+    host.MarkGameplayReady();
+    client.MarkGameplayReady();
+    if (!WaitUntil(() => host.PeerGameplayReady)) {
+        Console.Error.WriteLine("FAIL: host did not receive client gameplay READY.");
+        return 21;
+    }
+
+    var frame0 = host.AdvanceHostAuthorityFrame();
+    if (frame0 != 0 || !client.WaitForAuthorityFrame(0, 5000)) {
+        Console.Error.WriteLine("FAIL: authority frame 0 was not sealed/observed consistently.");
+        return 22;
+    }
+
     var hostPayload = new byte[] { 10, 20, 30, 40 };
     if (!host.SubmitLocalCommand(hostPayload)) {
         Console.Error.WriteLine("FAIL: host local command was not accepted for transport.");
-        return 21;
+        return 23;
     }
 
     if (!TryWaitForCommand(host, out var hostLocalCommit) || hostLocalCommit == null) {
         Console.Error.WriteLine("FAIL: host did not receive its own authority COMMIT for replay.");
-        return 22;
+        return 24;
     }
 
     if (!TryWaitForCommand(client, out var hostCommit) || hostCommit == null) {
         Console.Error.WriteLine("FAIL: client did not receive host authority COMMIT.");
-        return 23;
+        return 25;
     }
 
     if (hostLocalCommit.AuthoritySequence != 0
         || hostCommit.AuthoritySequence != 0
+        || hostLocalCommit.AuthorityFrame != 1
+        || hostCommit.AuthorityFrame != 1
         || hostLocalCommit.OriginClientId != "host"
         || hostCommit.OriginClientId != "host"
         || !hostLocalCommit.Payload.SequenceEqual(hostPayload)
         || !hostCommit.Payload.SequenceEqual(hostPayload)) {
-        Console.Error.WriteLine("FAIL: host-local COMMIT was not delivered identically to both peers.");
-        return 24;
+        Console.Error.WriteLine("FAIL: host-local COMMIT was not delivered identically for authority frame 1.");
+        return 26;
     }
 
     var clientPayload = new byte[] { 99, 88, 77 };
     if (!client.SubmitLocalCommand(clientPayload)) {
         Console.Error.WriteLine("FAIL: client local command was not accepted for transport.");
-        return 25;
+        return 27;
     }
 
     if (!TryWaitForCommand(host, out var hostReceivedClient) || hostReceivedClient == null) {
         Console.Error.WriteLine("FAIL: host did not receive/authorize client SUBMIT.");
-        return 26;
+        return 28;
     }
 
     if (!TryWaitForCommand(client, out var clientEchoCommit) || clientEchoCommit == null) {
         Console.Error.WriteLine("FAIL: client did not receive authority COMMIT for its own SUBMIT.");
-        return 27;
+        return 29;
     }
 
     if (hostReceivedClient.AuthoritySequence != 1
         || clientEchoCommit.AuthoritySequence != 1
+        || hostReceivedClient.AuthorityFrame != 1
+        || clientEchoCommit.AuthorityFrame != 1
         || hostReceivedClient.OriginClientId != "client"
         || clientEchoCommit.OriginClientId != "client"
         || !hostReceivedClient.Payload.SequenceEqual(clientPayload)
         || !clientEchoCommit.Payload.SequenceEqual(clientPayload)) {
-        Console.Error.WriteLine("FAIL: client SUBMIT was not converted to one consistent authority COMMIT.");
-        return 28;
+        Console.Error.WriteLine("FAIL: client SUBMIT was not converted to one consistent frame-1 authority COMMIT.");
+        return 30;
     }
 
-    Console.WriteLine($"PASS: persistent command session delivered the same authority stream to host/client on 127.0.0.1:{port}");
+    var frame1 = host.AdvanceHostAuthorityFrame();
+    if (frame1 != 1 || !client.WaitForAuthorityFrame(1, 5000)) {
+        Console.Error.WriteLine("FAIL: authority frame 1 marker did not arrive after its COMMITs.");
+        return 31;
+    }
+
+    host.ReportProgress(1, 1);
+    client.ReportProgress(1, 1);
+    var progressOk = WaitUntil(() => {
+        return host.TryGetPeerProgress(out var hostPeerFrame, out var hostPeerSeq)
+            && client.TryGetPeerProgress(out var clientPeerFrame, out var clientPeerSeq)
+            && hostPeerFrame == 1
+            && hostPeerSeq == 1
+            && clientPeerFrame == 1
+            && clientPeerSeq == 1;
+    });
+
+    if (!progressOk) {
+        Console.Error.WriteLine("FAIL: authority progress probes were not exchanged consistently.");
+        return 32;
+    }
+
+    Console.WriteLine($"PASS: persistent session sealed authority frames and delivered one ordered stream on 127.0.0.1:{port}");
     return 0;
 }
 
