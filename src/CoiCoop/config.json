@@ -16,5 +16,9 @@
   "trace_commands": {
     "default": true,
     "description": "Development option: log each processed player input command. Disable after compatibility testing."
+  },
+  "probe_command_serialization": {
+    "default": true,
+    "description": "Development option: serialize and immediately deserialize each processed input command without executing the clone."
   }
 }
