@@ -15,10 +15,11 @@ static int GetFreePort() {
 
 var port = GetFreePort();
 Exception? hostError = null;
+bool hostSucceeded = false;
 
 var hostThread = new Thread(() => {
     try {
-        LocalTransportProbe.HostOnce(port);
+        hostSucceeded = LocalTransportProbe.HostOnce(port, acceptTimeoutMs: 5000);
     }
     catch (Exception ex) {
         hostError = ex;
@@ -45,9 +46,14 @@ if (hostError is not null) {
     return 2;
 }
 
+if (!hostSucceeded) {
+    Console.Error.WriteLine("FAIL: host did not complete the handshake/PING exchange.");
+    return 3;
+}
+
 if (!clientSucceeded) {
     Console.Error.WriteLine("FAIL: client rejected handshake or PONG did not match.");
-    return 3;
+    return 4;
 }
 
 Console.WriteLine($"PASS: COI-Coop transport handshake + bidirectional ping succeeded on 127.0.0.1:{port}");
