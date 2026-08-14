@@ -20,11 +20,16 @@ public sealed class CoiCoopMod : DataOnlyMod {
             return;
         }
 
-        var mode = JsonConfig.GetInt("network_mode");
-        var port = JsonConfig.GetInt("server_port");
+        var mode = ReadEnvironmentInt("COI_COOP_MODE", JsonConfig.GetInt("network_mode"));
+        var port = ReadEnvironmentInt("COI_COOP_PORT", JsonConfig.GetInt("server_port"));
 
         if (mode == 0) {
-            Log.Info("COI-Coop: networking is disabled (network_mode = 0)");
+            Log.Info("COI-Coop: networking is disabled (mode 0)");
+            return;
+        }
+
+        if (port < 1024 || port > 65535) {
+            Log.Info($"COI-Coop: invalid port {port}; expected 1024-65535");
             return;
         }
 
@@ -35,12 +40,17 @@ public sealed class CoiCoopMod : DataOnlyMod {
         thread.Start();
     }
 
+    private static int ReadEnvironmentInt(string name, int fallback) {
+        var value = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(value, out var parsed) ? parsed : fallback;
+    }
+
     private static void RunTransportProbe(int mode, int port) {
         try {
             if (mode == 1) {
                 Log.Info($"COI-Coop: HOST waiting on 127.0.0.1:{port}");
                 LocalTransportProbe.HostOnce(port);
-                Log.Info("COI-Coop: HOST handshake completed successfully");
+                Log.Info("COI-Coop: HOST handshake + ping completed successfully");
                 return;
             }
 
@@ -48,12 +58,12 @@ public sealed class CoiCoopMod : DataOnlyMod {
                 Log.Info($"COI-Coop: CLIENT connecting to 127.0.0.1:{port}");
                 var connected = LocalTransportProbe.ClientOnce(port);
                 Log.Info(connected
-                    ? "COI-Coop: CLIENT handshake completed successfully"
+                    ? "COI-Coop: CLIENT handshake + ping completed successfully"
                     : "COI-Coop: CLIENT handshake was rejected");
                 return;
             }
 
-            Log.Info($"COI-Coop: unsupported network_mode value: {mode}");
+            Log.Info($"COI-Coop: unsupported network mode: {mode}");
         }
         catch (Exception ex) {
             Log.Info("COI-Coop: transport probe failed: " + ex);
