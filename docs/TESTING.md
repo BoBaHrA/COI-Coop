@@ -66,6 +66,14 @@ COI-Coop: INPUT Mafi.Core....SomeCommand
 
 Those command names are the data we need for the first real synchronization experiment.
 
+After leaving the game, the easiest way to collect only relevant lines is:
+
+```powershell
+.\scripts\collect-diagnostics.ps1 -CopyToClipboard
+```
+
+That finds the newest Captain of Industry log, filters `COI-Coop:` lines, prints them, and copies them to the clipboard.
+
 ## 3. Two-process local network probe
 
 Only after the single-process compatibility probe succeeds.
@@ -101,4 +109,4 @@ The prototype intentionally binds to `127.0.0.1`. LAN/Internet support comes aft
 
 ## What to send back after the first game test
 
-The useful lines are every log line containing `COI-Coop:` plus the command names produced by the four actions above. There is no need to send the entire log unless the game throws an exception.
+Paste the output of `collect-diagnostics.ps1`. There is no need to send the entire game log unless the game throws an exception or the collector finds no `COI-Coop:` lines.
