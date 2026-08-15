@@ -29,7 +29,7 @@ internal sealed class SandboxSourceDiscovery {
     private sealed class Candidate {
         public IEntity Entity { get; }
         public FieldInfo ProvidedProductField { get; }
-        public byte[] LastPayload { get; set; }
+        public string LastComparable { get; set; }
         public bool HasBaseline { get; set; }
 
         public Candidate(IEntity entity, FieldInfo providedProductField) {
@@ -78,9 +78,9 @@ internal sealed class SandboxSourceDiscovery {
     }
 
     /// <summary>
-    /// Reads one field per sandbox source. The first observation establishes a
-    /// baseline and is not transmitted. Later changes are returned as tiny binary
-    /// updates, already serialized through COI's own prototype-aware serializer.
+    /// Reads one field per sandbox source. Value serialization happens only after
+    /// its cheap stable textual representation changed, so the normal steady-state
+    /// path performs no BlobWriter allocations at all.
     /// </summary>
     public bool TryCaptureChanges(
         CommandRoundTripProbe codec,
@@ -108,6 +108,15 @@ internal sealed class SandboxSourceDiscovery {
                 return false;
             }
 
+            var comparable = SafeComparable(value);
+            if (!candidate.HasBaseline) {
+                candidate.LastComparable = comparable;
+                candidate.HasBaseline = true;
+                continue;
+            }
+
+            if (string.Equals(candidate.LastComparable, comparable, StringComparison.Ordinal)) continue;
+
             byte[] payload;
             string serializeError;
             if (!codec.TrySerializeValue(
@@ -120,15 +129,7 @@ internal sealed class SandboxSourceDiscovery {
                 return false;
             }
 
-            if (!candidate.HasBaseline) {
-                candidate.LastPayload = payload;
-                candidate.HasBaseline = true;
-                continue;
-            }
-
-            if (BytesEqual(candidate.LastPayload, payload)) continue;
-
-            candidate.LastPayload = payload;
+            candidate.LastComparable = comparable;
             if (updates == null) updates = new List<LocalUpdate>();
             updates.Add(new LocalUpdate(pair.Key, payload));
         }
@@ -156,8 +157,6 @@ internal sealed class SandboxSourceDiscovery {
 
         Candidate candidate;
         if (!m_candidates.TryGetValue(entityId, out candidate)) {
-            // Entity count can occasionally be observed before our local cache was
-            // rebuilt; force one scan by invalidating the count and retry once.
             m_lastKnownEntityCount = -1;
             RefreshIfNeeded();
             if (!m_candidates.TryGetValue(entityId, out candidate)) {
@@ -180,9 +179,7 @@ internal sealed class SandboxSourceDiscovery {
 
         try {
             candidate.ProvidedProductField.SetValue(candidate.Entity, decoded);
-            // Prevent the remote application from being echoed back as a local
-            // change on the next sample.
-            candidate.LastPayload = (byte[])valuePayload.Clone();
+            candidate.LastComparable = SafeComparable(decoded);
             candidate.HasBaseline = true;
             return true;
         }
@@ -232,12 +229,13 @@ internal sealed class SandboxSourceDiscovery {
         return false;
     }
 
-    private static bool BytesEqual(byte[] left, byte[] right) {
-        if (ReferenceEquals(left, right)) return true;
-        if (left == null || right == null || left.Length != right.Length) return false;
-        for (var i = 0; i < left.Length; i++) {
-            if (left[i] != right[i]) return false;
+    private static string SafeComparable(object value) {
+        if (value == null) return "<null>";
+        try {
+            return value.GetType().FullName + "|" + value;
         }
-        return true;
+        catch {
+            return value.GetType().FullName ?? "<unknown>";
+        }
     }
 }
