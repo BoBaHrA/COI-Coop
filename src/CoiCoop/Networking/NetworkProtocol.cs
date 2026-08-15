@@ -1,9 +1,10 @@
 using System;
+using System.Globalization;
 
 namespace CoiCoop.Networking;
 
 internal static class NetworkProtocol {
-    public const int ProtocolVersion = 3;
+    public const int ProtocolVersion = 4;
     public const string ModVersion = "0.0.1";
 
     public static string Hello() => $"HELLO|{ProtocolVersion}|{ModVersion}";
@@ -14,6 +15,19 @@ internal static class NetworkProtocol {
     public static string Frame(long authorityFrame) => $"FRAME|{authorityFrame}";
     public static string Progress(long authorityFrame, long appliedThroughSequence)
         => $"PROGRESS|{authorityFrame}|{appliedThroughSequence}";
+
+    public static string StateProbe(StateProbeSnapshot probe) {
+        if (probe == null) throw new ArgumentNullException(nameof(probe));
+
+        return "STATE|"
+            + probe.AuthorityFrame.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.AuthoritySequence.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.SimulationStep.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.EntityCount.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.EntityIdHash.ToString("X16", CultureInfo.InvariantCulture) + "|"
+            + probe.EntityStateHash.ToString("X16", CultureInfo.InvariantCulture) + "|"
+            + probe.HashedMemberCount.ToString(CultureInfo.InvariantCulture);
+    }
 
     public static string Submit(long clientCommandId, byte[] payload) {
         if (payload == null) throw new ArgumentNullException(nameof(payload));
@@ -88,6 +102,40 @@ internal static class NetworkProtocol {
             && parts.Length == 3
             && long.TryParse(parts[1], out authorityFrame)
             && long.TryParse(parts[2], out appliedThroughSequence);
+    }
+
+    public static bool TryReadStateProbe(string line, out StateProbeSnapshot probe) {
+        probe = null;
+
+        long frame;
+        long sequence;
+        long step;
+        int entityCount;
+        ulong entityIdHash;
+        ulong entityStateHash;
+        int memberCount;
+
+        if (!TrySplit(line, "STATE", out var parts)
+            || parts.Length != 8
+            || !long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out frame)
+            || !long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out sequence)
+            || !long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out step)
+            || !int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out entityCount)
+            || !ulong.TryParse(parts[5], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out entityIdHash)
+            || !ulong.TryParse(parts[6], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out entityStateHash)
+            || !int.TryParse(parts[7], NumberStyles.Integer, CultureInfo.InvariantCulture, out memberCount)) {
+            return false;
+        }
+
+        probe = new StateProbeSnapshot(
+            frame,
+            sequence,
+            step,
+            entityCount,
+            entityIdHash,
+            entityStateHash,
+            memberCount);
+        return true;
     }
 
     public static bool TryReadSubmit(string line, out long clientCommandId, out byte[] payload) {
