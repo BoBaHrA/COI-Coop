@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Text;
@@ -9,8 +10,8 @@ namespace CoiCoop;
 /// <summary>
 /// Development bridge for locating the current COI placement/build controller
 /// without hard-coding private 0.8.7 members. Placement UI does not necessarily
-/// live in Mafi.Core, so discovery scans all currently loaded game assemblies and
-/// also accepts resolver ObjectInstantiated callbacks for controllers created later.
+/// live in Mafi.Core, so discovery scans all currently loaded game assemblies,
+/// inspects resolver storage, and accepts ObjectInstantiated callbacks.
 /// </summary>
 internal sealed class PlacementPreviewDiscovery {
     private sealed class Candidate {
@@ -47,10 +48,6 @@ internal sealed class PlacementPreviewDiscovery {
         }
     }
 
-    /// <summary>
-    /// Called for every resolver-created object. This is important because many
-    /// UI/input controllers are created after the mod's Initialize callback.
-    /// </summary>
     public bool ObserveInstance(object instance) {
         if (instance == null) return false;
         var type = instance.GetType();
@@ -58,10 +55,6 @@ internal sealed class PlacementPreviewDiscovery {
         return TryAddCandidate(type, instance);
     }
 
-    /// <summary>
-    /// Retry scanning loaded assemblies while no controller has been discovered.
-    /// Assemblies containing UI controllers can be loaded after mod initialization.
-    /// </summary>
     public bool RefreshResolvedCandidates(bool force = false) {
         if (!force && m_candidates.Count > 0) return false;
 
@@ -70,40 +63,10 @@ internal sealed class PlacementPreviewDiscovery {
         m_lastRefreshMs = now;
 
         var before = m_candidates.Count;
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies()) {
-            if (!LooksLikeGameAssembly(assembly)) continue;
-
-            Type[] types;
-            try {
-                types = assembly.GetTypes();
-            }
-            catch (ReflectionTypeLoadException ex) {
-                types = ex.Types ?? Array.Empty<Type>();
-            }
-            catch {
-                continue;
-            }
-
-            foreach (var type in types) {
-                if (type == null || !LooksLikePlacementController(type)) continue;
-
-                object instance;
-                try {
-                    var resolved = m_resolver.GetResolvedInstance(type);
-                    if (!resolved.HasValue) continue;
-                    instance = resolved.Value;
-                }
-                catch {
-                    continue;
-                }
-
-                TryAddCandidate(type, instance);
-                if (m_candidates.Count >= 32) break;
-            }
-
-            if (m_candidates.Count >= 32) break;
+        ScanResolverStorage();
+        if (m_candidates.Count == 0) {
+            ScanLoadedGameAssemblies();
         }
-
         return m_candidates.Count != before;
     }
 
@@ -142,6 +105,103 @@ internal sealed class PlacementPreviewDiscovery {
         m_lastObservation = current;
         observation = current;
         return true;
+    }
+
+    private void ScanResolverStorage() {
+        try {
+            var resolverType = m_resolver.GetType();
+            foreach (var field in resolverType.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
+                object value;
+                try { value = field.GetValue(m_resolver); }
+                catch { continue; }
+                ScanContainerValue(value, 0);
+                if (m_candidates.Count >= 32) return;
+            }
+        }
+        catch {
+            // Discovery is best-effort and must never affect simulation.
+        }
+    }
+
+    private void ScanContainerValue(object value, int depth) {
+        if (value == null || depth > 2 || m_candidates.Count >= 32) return;
+
+        if (ObserveInstance(value)) return;
+        if (value is string) return;
+
+        var dictionary = value as IDictionary;
+        if (dictionary != null) {
+            var seen = 0;
+            foreach (DictionaryEntry entry in dictionary) {
+                ScanContainerValue(entry.Value, depth + 1);
+                if (++seen >= 4096 || m_candidates.Count >= 32) break;
+            }
+            return;
+        }
+
+        var enumerable = value as IEnumerable;
+        if (enumerable != null) {
+            var seen = 0;
+            try {
+                foreach (var item in enumerable) {
+                    if (item == null) continue;
+
+                    var itemType = item.GetType();
+                    var valueProperty = itemType.GetProperty("Value", BindingFlags.Instance | BindingFlags.Public);
+                    if (valueProperty != null && valueProperty.GetIndexParameters().Length == 0) {
+                        try {
+                            ScanContainerValue(valueProperty.GetValue(item, null), depth + 1);
+                        }
+                        catch {
+                            ScanContainerValue(item, depth + 1);
+                        }
+                    }
+                    else {
+                        ScanContainerValue(item, depth + 1);
+                    }
+
+                    if (++seen >= 4096 || m_candidates.Count >= 32) break;
+                }
+            }
+            catch {
+                // Ignore enumerators that are not safe outside their owner.
+            }
+        }
+    }
+
+    private void ScanLoadedGameAssemblies() {
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies()) {
+            if (!LooksLikeGameAssembly(assembly)) continue;
+
+            Type[] types;
+            try {
+                types = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex) {
+                types = ex.Types ?? Array.Empty<Type>();
+            }
+            catch {
+                continue;
+            }
+
+            foreach (var type in types) {
+                if (type == null || !LooksLikePlacementController(type)) continue;
+
+                object instance;
+                try {
+                    var resolved = m_resolver.GetResolvedInstance(type);
+                    if (!resolved.HasValue) continue;
+                    instance = resolved.Value;
+                }
+                catch {
+                    continue;
+                }
+
+                TryAddCandidate(type, instance);
+                if (m_candidates.Count >= 32) break;
+            }
+            if (m_candidates.Count >= 32) break;
+        }
     }
 
     private bool TryAddCandidate(Type type, object instance) {
@@ -248,7 +308,6 @@ internal sealed class PlacementPreviewDiscovery {
             formatted = type.Name + "#" + (stableId ?? "null");
             return true;
         }
-
         return false;
     }
 
@@ -258,40 +317,23 @@ internal sealed class PlacementPreviewDiscovery {
         var names = new[] { "Id", "ID", "ProtoId", "PrototypeId", "m_id" };
 
         for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            foreach (var field in current.GetFields(
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
+            foreach (var field in current.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
                 for (var i = 0; i < names.Length; i++) {
                     if (!string.Equals(field.Name, names[i], StringComparison.Ordinal)) continue;
-                    try {
-                        id = field.GetValue(value);
-                        return true;
-                    }
-                    catch {
-                        return false;
-                    }
+                    try { id = field.GetValue(value); return true; }
+                    catch { return false; }
                 }
             }
         }
 
         foreach (var property in type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
             if (property.GetIndexParameters().Length != 0 || property.GetGetMethod(true) == null) continue;
-            var matched = false;
             for (var i = 0; i < names.Length; i++) {
-                if (string.Equals(property.Name, names[i], StringComparison.Ordinal)) {
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) continue;
-            try {
-                id = property.GetValue(value, null);
-                return true;
-            }
-            catch {
-                return false;
+                if (!string.Equals(property.Name, names[i], StringComparison.Ordinal)) continue;
+                try { id = property.GetValue(value, null); return true; }
+                catch { return false; }
             }
         }
-
         return false;
     }
 
