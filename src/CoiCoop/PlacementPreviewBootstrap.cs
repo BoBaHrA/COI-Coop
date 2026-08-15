@@ -7,12 +7,12 @@ using Mafi.Core.Simulation;
 namespace CoiCoop;
 
 /// <summary>
-/// Development bootstrap for real-time remote placement previews.
-/// Kept independent from authoritative replay so preview failures can never halt
-/// or mutate the simulation. A future renderer will consume the same sidecar data.
+/// Development bootstrap for real-time remote placement previews plus targeted
+/// discovery of sandbox source state that bypasses InputScheduler.
 /// </summary>
 internal sealed class PlacementPreviewBootstrap : IDisposable {
     private const int SampleIntervalMs = 100;
+    private const int SandboxSampleIntervalMs = 250;
     private const int MaxLoggedObservationChars = 900;
     private static readonly object s_lock = new object();
     private static PlacementPreviewBootstrap s_current;
@@ -21,10 +21,13 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private readonly int m_mode;
     private readonly int m_previewPort;
     private PlacementPreviewDiscovery m_discovery;
+    private SandboxSourceDiscovery m_sandboxDiscovery;
     private PlacementPreviewSession m_session;
     private ISimLoopEvents m_simLoop;
     private int m_lastSampleMs;
+    private int m_lastSandboxSampleMs;
     private int m_lastLoggedCandidateCount = -1;
+    private int m_lastLoggedSandboxCandidateCount = -1;
     private bool m_hooked;
     private bool m_resolverObserved;
 
@@ -53,6 +56,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
 
     private void Start() {
         m_discovery = new PlacementPreviewDiscovery(m_resolver);
+        m_sandboxDiscovery = new SandboxSourceDiscovery(m_resolver);
         m_session = new PlacementPreviewSession(
             m_mode == 1,
             m_previewPort,
@@ -101,7 +105,14 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         if (!ReferenceEquals(s_current, this) || m_session == null) return;
 
         PumpIncoming();
-        if (!m_session.IsConnected || m_discovery == null) return;
+        if (!m_session.IsConnected) return;
+
+        SamplePlacementPreview();
+        SampleSandboxSources();
+    }
+
+    private void SamplePlacementPreview() {
+        if (m_discovery == null) return;
 
         var changed = m_discovery.RefreshResolvedCandidates();
         if (changed || m_lastLoggedCandidateCount != m_discovery.CandidateCount) {
@@ -124,6 +135,26 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             "COI-Coop: PREVIEW TX rev=" + revision
             + " bytes=" + payload.Length
             + " " + Truncate(observation));
+    }
+
+    private void SampleSandboxSources() {
+        if (m_sandboxDiscovery == null) return;
+
+        var now = Environment.TickCount;
+        if (unchecked(now - m_lastSandboxSampleMs) < SandboxSampleIntervalMs) return;
+        m_lastSandboxSampleMs = now;
+
+        var changedCandidates = m_sandboxDiscovery.Refresh();
+        if (changedCandidates || m_lastLoggedSandboxCandidateCount != m_sandboxDiscovery.CandidateCount) {
+            m_lastLoggedSandboxCandidateCount = m_sandboxDiscovery.CandidateCount;
+            Log.Info(
+                "COI-Coop: SANDBOX discovery candidates=" + m_sandboxDiscovery.CandidateCount
+                + " [" + Truncate(m_sandboxDiscovery.CandidateSummary) + "]");
+        }
+
+        string observation;
+        if (!m_sandboxDiscovery.TryCaptureChanged(out observation)) return;
+        Log.Info("COI-Coop: SANDBOX STATE " + Truncate(observation));
     }
 
     private void PumpIncoming() {
@@ -172,6 +203,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_session?.Dispose();
         m_session = null;
         m_discovery = null;
+        m_sandboxDiscovery = null;
         m_simLoop = null;
         m_hooked = false;
     }
