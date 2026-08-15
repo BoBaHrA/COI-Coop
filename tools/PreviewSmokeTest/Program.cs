@@ -78,6 +78,25 @@ if (hostState == null || Encoding.UTF8.GetString(hostState.Payload) != "x=2;y=3;
     return 5;
 }
 
+// Reliable adapter messages must survive even when a newer preview is published
+// immediately afterwards.
+var reliablePayload = Encoding.UTF8.GetBytes("entity=1457;product=sand");
+host.PublishReliable("SANDBOX_SOURCE", reliablePayload);
+host.Publish("PLACEMENT", Encoding.UTF8.GetBytes("x=99;y=99;rot=3"));
+
+PlacementPreviewState? reliableState = null;
+if (!WaitUntil(() => client.TryDequeueReliablePeerState(out reliableState))) {
+    Console.Error.WriteLine("FAIL: reliable sidecar state did not arrive.");
+    return 6;
+}
+
+if (reliableState == null
+    || reliableState.Kind != "SANDBOX_SOURCE"
+    || Encoding.UTF8.GetString(reliableState.Payload) != "entity=1457;product=sand") {
+    Console.Error.WriteLine("FAIL: reliable sidecar payload mismatch.");
+    return 7;
+}
+
 var clearRevision = client.Clear();
 PlacementPreviewState? clearState = null;
 if (!WaitUntil(() => {
@@ -86,13 +105,13 @@ if (!WaitUntil(() => {
         return state.Revision >= clearRevision;
     })) {
     Console.Error.WriteLine("FAIL: preview clear did not arrive.");
-    return 6;
+    return 8;
 }
 
 if (clearState == null || clearState.Kind != "NONE" || clearState.Payload.Length != 0) {
     Console.Error.WriteLine("FAIL: preview clear payload was invalid.");
-    return 7;
+    return 9;
 }
 
-Console.WriteLine($"PASS: best-effort latest-wins preview sidecar worked bidirectionally on 127.0.0.1:{port}");
+Console.WriteLine($"PASS: latest-wins preview + reliable sidecar lane worked bidirectionally on 127.0.0.1:{port}");
 return 0;
