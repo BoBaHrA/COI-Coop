@@ -3,14 +3,14 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Text;
 using Mafi;
-using Mafi.Core.Input;
 
 namespace CoiCoop;
 
 /// <summary>
 /// Development bridge for locating the current COI placement/build controller
-/// without hard-coding private 0.8.7 members. It samples only likely placement
-/// fields and emits a compact text observation when those values change.
+/// without hard-coding private 0.8.7 members. Placement UI does not necessarily
+/// live in Mafi.Core, so discovery scans all currently loaded game assemblies and
+/// also accepts resolver ObjectInstantiated callbacks for controllers created later.
 /// </summary>
 internal sealed class PlacementPreviewDiscovery {
     private sealed class Candidate {
@@ -27,11 +27,13 @@ internal sealed class PlacementPreviewDiscovery {
 
     private readonly DependencyResolver m_resolver;
     private readonly List<Candidate> m_candidates = new List<Candidate>();
+    private readonly HashSet<object> m_candidateInstances = new HashSet<object>(ReferenceEqualityComparer.Instance);
     private string m_lastObservation;
+    private int m_lastRefreshMs;
 
     public PlacementPreviewDiscovery(DependencyResolver resolver) {
         m_resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
-        DiscoverCandidates();
+        RefreshResolvedCandidates(force: true);
     }
 
     public int CandidateCount => m_candidates.Count;
@@ -45,11 +47,71 @@ internal sealed class PlacementPreviewDiscovery {
         }
     }
 
+    /// <summary>
+    /// Called for every resolver-created object. This is important because many
+    /// UI/input controllers are created after the mod's Initialize callback.
+    /// </summary>
+    public bool ObserveInstance(object instance) {
+        if (instance == null) return false;
+        var type = instance.GetType();
+        if (!LooksLikePlacementController(type)) return false;
+        return TryAddCandidate(type, instance);
+    }
+
+    /// <summary>
+    /// Retry scanning loaded assemblies while no controller has been discovered.
+    /// Assemblies containing UI controllers can be loaded after mod initialization.
+    /// </summary>
+    public bool RefreshResolvedCandidates(bool force = false) {
+        if (!force && m_candidates.Count > 0) return false;
+
+        var now = Environment.TickCount;
+        if (!force && unchecked(now - m_lastRefreshMs) < 2000) return false;
+        m_lastRefreshMs = now;
+
+        var before = m_candidates.Count;
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies()) {
+            if (!LooksLikeGameAssembly(assembly)) continue;
+
+            Type[] types;
+            try {
+                types = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex) {
+                types = ex.Types ?? Array.Empty<Type>();
+            }
+            catch {
+                continue;
+            }
+
+            foreach (var type in types) {
+                if (type == null || !LooksLikePlacementController(type)) continue;
+
+                object instance;
+                try {
+                    var resolved = m_resolver.GetResolvedInstance(type);
+                    if (!resolved.HasValue) continue;
+                    instance = resolved.Value;
+                }
+                catch {
+                    continue;
+                }
+
+                TryAddCandidate(type, instance);
+                if (m_candidates.Count >= 32) break;
+            }
+
+            if (m_candidates.Count >= 32) break;
+        }
+
+        return m_candidates.Count != before;
+    }
+
     public bool TryCaptureChanged(out string observation) {
         observation = null;
         if (m_candidates.Count == 0) return false;
 
-        var builder = new StringBuilder(512);
+        var builder = new StringBuilder(768);
         foreach (var candidate in m_candidates) {
             var wroteCandidate = false;
             foreach (var field in candidate.Fields) {
@@ -82,45 +144,42 @@ internal sealed class PlacementPreviewDiscovery {
         return true;
     }
 
-    private void DiscoverCandidates() {
-        Type[] types;
-        try {
-            types = typeof(InputScheduler).Assembly.GetTypes();
-        }
-        catch (ReflectionTypeLoadException ex) {
-            types = ex.Types ?? Array.Empty<Type>();
-        }
+    private bool TryAddCandidate(Type type, object instance) {
+        if (type == null || instance == null || m_candidateInstances.Contains(instance)) return false;
 
-        Array.Sort(types, (a, b) => string.CompareOrdinal(a?.FullName, b?.FullName));
-        foreach (var type in types) {
-            if (type == null || !LooksLikePlacementController(type)) continue;
+        var fields = GetInterestingFields(type);
+        if (fields.Length == 0) return false;
 
-            object instance;
-            try {
-                var resolved = m_resolver.GetResolvedInstance(type);
-                if (!resolved.HasValue) continue;
-                instance = resolved.Value;
-            }
-            catch {
-                continue;
-            }
+        m_candidateInstances.Add(instance);
+        m_candidates.Add(new Candidate(type, instance, fields));
+        m_candidates.Sort((a, b) => string.CompareOrdinal(a.Type.FullName, b.Type.FullName));
+        return true;
+    }
 
-            var fields = GetInterestingFields(type);
-            if (fields.Length == 0) continue;
-            m_candidates.Add(new Candidate(type, instance, fields));
-            if (m_candidates.Count >= 16) break;
-        }
+    private static bool LooksLikeGameAssembly(Assembly assembly) {
+        if (assembly == null) return false;
+        var name = assembly.GetName().Name ?? string.Empty;
+        return name.StartsWith("Mafi", StringComparison.OrdinalIgnoreCase)
+            || name.IndexOf("Captain", StringComparison.OrdinalIgnoreCase) >= 0
+            || name.IndexOf("Industry", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static bool LooksLikePlacementController(Type type) {
+        if (type == null || type.IsAbstract || type.IsInterface || type.IsGenericTypeDefinition) return false;
+
         var name = type.FullName ?? type.Name;
         if (name.IndexOf("Cmd", StringComparison.OrdinalIgnoreCase) >= 0) return false;
 
         var actionWord = name.IndexOf("Build", StringComparison.OrdinalIgnoreCase) >= 0
             || name.IndexOf("Place", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("Placement", StringComparison.OrdinalIgnoreCase) >= 0;
+            || name.IndexOf("Placement", StringComparison.OrdinalIgnoreCase) >= 0
+            || name.IndexOf("Construction", StringComparison.OrdinalIgnoreCase) >= 0
+            || name.IndexOf("Entity", StringComparison.OrdinalIgnoreCase) >= 0
+            || name.IndexOf("Transport", StringComparison.OrdinalIgnoreCase) >= 0;
         var controllerWord = name.IndexOf("Controller", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("Input", StringComparison.OrdinalIgnoreCase) >= 0;
+            || name.IndexOf("Input", StringComparison.OrdinalIgnoreCase) >= 0
+            || name.IndexOf("Tool", StringComparison.OrdinalIgnoreCase) >= 0
+            || name.IndexOf("Planner", StringComparison.OrdinalIgnoreCase) >= 0;
         return actionWord && controllerWord;
     }
 
@@ -136,7 +195,10 @@ internal sealed class PlacementPreviewDiscovery {
             }
         }
 
-        result.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+        result.Sort((a, b) => {
+            var declaring = string.CompareOrdinal(a.DeclaringType?.FullName ?? string.Empty, b.DeclaringType?.FullName ?? string.Empty);
+            return declaring != 0 ? declaring : string.CompareOrdinal(a.Name, b.Name);
+        });
         return result.ToArray();
     }
 
@@ -158,7 +220,9 @@ internal sealed class PlacementPreviewDiscovery {
             || combined.IndexOf("selected", StringComparison.OrdinalIgnoreCase) >= 0
             || combined.IndexOf("placement", StringComparison.OrdinalIgnoreCase) >= 0
             || combined.IndexOf("preview", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("entity", StringComparison.OrdinalIgnoreCase) >= 0;
+            || combined.IndexOf("entity", StringComparison.OrdinalIgnoreCase) >= 0
+            || combined.IndexOf("building", StringComparison.OrdinalIgnoreCase) >= 0
+            || combined.IndexOf("transport", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static bool TryFormatValue(object value, out string formatted) {
@@ -172,7 +236,7 @@ internal sealed class PlacementPreviewDiscovery {
         if (value is string || value is bool || value is char || type.IsEnum || type.IsPrimitive || type.IsValueType) {
             try {
                 formatted = value.ToString();
-                return formatted != null && formatted.Length <= 180;
+                return formatted != null && formatted.Length <= 240;
             }
             catch {
                 return false;
@@ -229,5 +293,11 @@ internal sealed class PlacementPreviewDiscovery {
         }
 
         return false;
+    }
+
+    private sealed class ReferenceEqualityComparer : IEqualityComparer<object> {
+        public static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
+        public new bool Equals(object x, object y) => ReferenceEquals(x, y);
+        public int GetHashCode(object obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
     }
 }
