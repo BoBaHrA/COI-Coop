@@ -24,6 +24,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     private readonly Action<string> m_log;
     private readonly ConcurrentQueue<string> m_outgoing = new ConcurrentQueue<string>();
     private readonly ConcurrentQueue<ReceivedAuthorityCommand> m_incoming = new ConcurrentQueue<ReceivedAuthorityCommand>();
+    private readonly ConcurrentQueue<StateProbeSnapshot> m_incomingStateProbes = new ConcurrentQueue<StateProbeSnapshot>();
     private readonly AuthorityCommandSequencer m_sequencer = new AuthorityCommandSequencer();
     private readonly object m_authorityLock = new object();
 
@@ -142,6 +143,19 @@ internal sealed class PersistentCommandSession : IDisposable {
         authorityFrame = Interlocked.Read(ref m_peerProgressFrame);
         appliedThroughSequence = Interlocked.Read(ref m_peerProgressSequence);
         return authorityFrame >= 0;
+    }
+
+    public void ReportStateProbe(StateProbeSnapshot probe) {
+        if (probe == null) throw new ArgumentNullException(nameof(probe));
+        if (!m_connected || !m_localGameplayReady) {
+            return;
+        }
+
+        m_outgoing.Enqueue(NetworkProtocol.StateProbe(probe));
+    }
+
+    public bool TryDequeueStateProbe(out StateProbeSnapshot probe) {
+        return m_incomingStateProbes.TryDequeue(out probe);
     }
 
     public bool SubmitLocalCommand(byte[] payload) {
@@ -341,6 +355,12 @@ internal sealed class PersistentCommandSession : IDisposable {
             return;
         }
 
+        StateProbeSnapshot stateProbe;
+        if (NetworkProtocol.TryReadStateProbe(line, out stateProbe)) {
+            m_incomingStateProbes.Enqueue(stateProbe);
+            return;
+        }
+
         if (NetworkProtocol.IsReady(line)) {
             if (m_isHost) {
                 m_peerGameplayReady = true;
@@ -457,6 +477,8 @@ internal sealed class PersistentCommandSession : IDisposable {
         if (!m_isHost) {
             Interlocked.Exchange(ref m_latestAnnouncedAuthorityFrame, -1);
         }
+        while (m_incomingStateProbes.TryDequeue(out _)) {
+        }
         m_log?.Invoke(m_isHost ? "HOST session connected" : "CLIENT session connected");
     }
 
@@ -469,6 +491,8 @@ internal sealed class PersistentCommandSession : IDisposable {
         m_peerGameplayReady = false;
 
         while (m_outgoing.TryDequeue(out _)) {
+        }
+        while (m_incomingStateProbes.TryDequeue(out _)) {
         }
     }
 
