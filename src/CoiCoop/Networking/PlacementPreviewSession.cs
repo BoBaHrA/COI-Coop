@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -8,8 +9,12 @@ using System.Threading;
 namespace CoiCoop.Networking;
 
 /// <summary>
-/// Best-effort latest-wins transport for presentation-only co-op placement previews.
-/// This channel never gates simulation and never participates in authority ordering.
+/// Auxiliary sidecar transport.
+///
+/// Presentation previews use a latest-wins lane. Small state adapters that must
+/// not be overwritten by a newer mouse preview (currently sandbox source state)
+/// use a separate reliable FIFO lane on the same TCP connection. Neither lane
+/// participates in authoritative simulation ordering or can halt the main replay.
 /// </summary>
 internal sealed class PlacementPreviewSession : IDisposable {
     private const string HelloLine = "COI_COOP_PREVIEW|1";
@@ -21,6 +26,10 @@ internal sealed class PlacementPreviewSession : IDisposable {
     private readonly Action<string> m_log;
     private readonly object m_outgoingLock = new object();
     private readonly object m_incomingLock = new object();
+    private readonly ConcurrentQueue<PlacementPreviewState> m_reliableOutgoing
+        = new ConcurrentQueue<PlacementPreviewState>();
+    private readonly ConcurrentQueue<PlacementPreviewState> m_reliableIncoming
+        = new ConcurrentQueue<PlacementPreviewState>();
 
     private Thread m_thread;
     private volatile bool m_stop;
@@ -61,6 +70,12 @@ internal sealed class PlacementPreviewSession : IDisposable {
         return revision;
     }
 
+    public long PublishReliable(string kind, byte[] payload) {
+        var revision = Interlocked.Increment(ref m_nextRevision) - 1;
+        m_reliableOutgoing.Enqueue(new PlacementPreviewState(revision, kind, payload));
+        return revision;
+    }
+
     public long Clear() => Publish("NONE", Array.Empty<byte>());
 
     public bool TryTakeLatestPeerState(out PlacementPreviewState state) {
@@ -73,6 +88,10 @@ internal sealed class PlacementPreviewSession : IDisposable {
             m_lastConsumedIncomingRevision = state.Revision;
             return true;
         }
+    }
+
+    public bool TryDequeueReliablePeerState(out PlacementPreviewState state) {
+        return m_reliableIncoming.TryDequeue(out state);
     }
 
     private void Run() {
@@ -165,6 +184,14 @@ internal sealed class PlacementPreviewSession : IDisposable {
 
     private void RunConnected(NetworkStream stream, StreamReader reader, StreamWriter writer) {
         while (!m_stop) {
+            PlacementPreviewState reliable;
+            while (m_reliableOutgoing.TryDequeue(out reliable)) {
+                writer.WriteLine(Serialize(reliable));
+                if (reliable.Revision > m_lastSentRevision) {
+                    m_lastSentRevision = reliable.Revision;
+                }
+            }
+
             PlacementPreviewState outgoing = null;
             lock (m_outgoingLock) {
                 if (m_latestOutgoing != null && m_latestOutgoing.Revision > m_lastSentRevision) {
@@ -182,6 +209,12 @@ internal sealed class PlacementPreviewSession : IDisposable {
                 if (line == null) throw new IOException("Preview peer closed connection.");
                 PlacementPreviewState incoming;
                 if (!TryParse(line, out incoming)) continue;
+
+                if (IsReliableKind(incoming.Kind)) {
+                    m_reliableIncoming.Enqueue(incoming);
+                    continue;
+                }
+
                 lock (m_incomingLock) {
                     if (m_latestIncoming == null || incoming.Revision > m_latestIncoming.Revision) {
                         m_latestIncoming = incoming;
@@ -191,6 +224,10 @@ internal sealed class PlacementPreviewSession : IDisposable {
 
             Thread.Sleep(LoopSleepMs);
         }
+    }
+
+    private static bool IsReliableKind(string kind) {
+        return kind != null && kind.StartsWith("SANDBOX_", StringComparison.Ordinal);
     }
 
     private static string Serialize(PlacementPreviewState state) {
@@ -209,7 +246,10 @@ internal sealed class PlacementPreviewSession : IDisposable {
         }
 
         try {
-            state = new PlacementPreviewState(revision, parts[2], Convert.FromBase64String(parts[3] ?? string.Empty));
+            state = new PlacementPreviewState(
+                revision,
+                parts[2],
+                Convert.FromBase64String(parts[3] ?? string.Empty));
             return true;
         }
         catch (FormatException) {
@@ -224,12 +264,15 @@ internal sealed class PlacementPreviewSession : IDisposable {
             m_latestIncoming = null;
             m_lastConsumedIncomingRevision = -1;
         }
+        while (m_reliableIncoming.TryDequeue(out _)) { }
         m_log?.Invoke(m_isHost ? "PREVIEW HOST connected" : "PREVIEW CLIENT connected");
     }
 
     private void SetDisconnected() {
         if (m_connected) m_log?.Invoke(m_isHost ? "PREVIEW HOST disconnected" : "PREVIEW CLIENT disconnected");
         m_connected = false;
+        while (m_reliableOutgoing.TryDequeue(out _)) { }
+        while (m_reliableIncoming.TryDequeue(out _)) { }
     }
 
     private static void Configure(TcpClient client) {
