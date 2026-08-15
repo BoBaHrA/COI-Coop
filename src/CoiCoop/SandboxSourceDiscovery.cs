@@ -1,34 +1,52 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
-using System.Text;
 using Mafi;
 using Mafi.Core.Entities;
 
 namespace CoiCoop;
 
 /// <summary>
-/// Development-only targeted audit for sandbox/infinite material sources that
-/// appear to mutate entity state outside InputScheduler. It does not modify the
-/// simulation; it only reports candidate entity fields when their values change.
+/// Targeted sidecar synchronization for the sandbox ProductsSourceEntity.
+///
+/// Runtime testing on COI 0.8.7 identified the selected source material as the
+/// compiler backing field <ProvidedProduct>k__BackingField. We intentionally do
+/// not perform broad reflection scans here: candidate entities are indexed only
+/// when the global entity count changes, and each candidate reads exactly one
+/// cached field.
 /// </summary>
 internal sealed class SandboxSourceDiscovery {
-    private sealed class Candidate {
-        public IEntity Entity { get; }
-        public FieldInfo[] Fields { get; }
+    internal sealed class LocalUpdate {
+        public int EntityId { get; }
+        public byte[] ValuePayload { get; }
 
-        public Candidate(IEntity entity, FieldInfo[] fields) {
-            Entity = entity;
-            Fields = fields;
+        public LocalUpdate(int entityId, byte[] valuePayload) {
+            EntityId = entityId;
+            ValuePayload = valuePayload ?? Array.Empty<byte>();
         }
     }
 
+    private sealed class Candidate {
+        public IEntity Entity { get; }
+        public FieldInfo ProvidedProductField { get; }
+        public byte[] LastPayload { get; set; }
+        public bool HasBaseline { get; set; }
+
+        public Candidate(IEntity entity, FieldInfo providedProductField) {
+            Entity = entity;
+            ProvidedProductField = providedProductField;
+        }
+    }
+
+    private const string ProductsSourceTypeName = "Mafi.Base.Prototypes.Sandbox.ProductsSourceEntity";
+    private const string ProvidedProductBackingField = "<ProvidedProduct>k__BackingField";
+
     private readonly DependencyResolver m_resolver;
-    private readonly List<Candidate> m_candidates = new List<Candidate>();
-    private readonly HashSet<int> m_candidateIds = new HashSet<int>();
+    private readonly Dictionary<int, Candidate> m_candidates = new Dictionary<int, Candidate>();
+    private readonly Dictionary<Type, FieldInfo> m_fieldByType = new Dictionary<Type, FieldInfo>();
+    private readonly HashSet<Type> m_typesWithoutField = new HashSet<Type>();
     private EntitiesManager m_entities;
-    private string m_lastObservation;
-    private int m_lastRefreshMs;
+    private int m_lastKnownEntityCount = -1;
 
     public SandboxSourceDiscovery(DependencyResolver resolver) {
         m_resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
@@ -36,202 +54,190 @@ internal sealed class SandboxSourceDiscovery {
 
     public int CandidateCount => m_candidates.Count;
 
-    public string CandidateSummary {
-        get {
-            if (m_candidates.Count == 0) return "none";
-            var items = new List<string>();
-            foreach (var candidate in m_candidates) {
-                items.Add(candidate.Entity.Id.Value + ":" + candidate.Entity.GetType().FullName);
-                if (items.Count >= 20) break;
-            }
-            return string.Join(", ", items);
-        }
-    }
+    public bool RefreshIfNeeded() {
+        if (!EnsureEntitiesManager()) return false;
 
-    public bool Refresh(bool force = false) {
-        var now = Environment.TickCount;
-        if (!force && unchecked(now - m_lastRefreshMs) < 3000) return false;
-        m_lastRefreshMs = now;
-
-        if (m_entities == null) {
-            EntitiesManager entities;
-            if (!m_resolver.TryGetResolvedDependency<EntitiesManager>(out entities) || entities == null) {
-                return false;
-            }
-            m_entities = entities;
-        }
+        var currentCount = m_entities.EntitiesCount;
+        if (currentCount == m_lastKnownEntityCount) return false;
+        m_lastKnownEntityCount = currentCount;
 
         var before = m_candidates.Count;
         foreach (IEntity entity in m_entities.Entities) {
-            if (entity == null || m_candidateIds.Contains(entity.Id.Value)) continue;
+            if (entity == null || m_candidates.ContainsKey(entity.Id.Value)) continue;
 
             var type = entity.GetType();
-            var fields = GetInterestingFields(type);
-            if (fields.Length == 0) continue;
-            if (!LooksLikeSandboxSource(type) && !HasStrongSourceField(fields)) continue;
+            if (!IsProductsSourceType(type)) continue;
 
-            m_candidateIds.Add(entity.Id.Value);
-            m_candidates.Add(new Candidate(entity, fields));
-            if (m_candidates.Count >= 64) break;
+            var field = GetProvidedProductField(type);
+            if (field == null) continue;
+
+            m_candidates.Add(entity.Id.Value, new Candidate(entity, field));
         }
 
-        m_candidates.Sort((a, b) => a.Entity.Id.Value.CompareTo(b.Entity.Id.Value));
         return before != m_candidates.Count;
     }
 
-    public bool TryCaptureChanged(out string observation) {
-        observation = null;
-        if (m_candidates.Count == 0) return false;
+    /// <summary>
+    /// Reads one field per sandbox source. The first observation establishes a
+    /// baseline and is not transmitted. Later changes are returned as tiny binary
+    /// updates, already serialized through COI's own prototype-aware serializer.
+    /// </summary>
+    public bool TryCaptureChanges(
+        CommandRoundTripProbe codec,
+        out List<LocalUpdate> updates,
+        out string error) {
 
-        var builder = new StringBuilder(1024);
-        foreach (var candidate in m_candidates) {
-            var entity = candidate.Entity;
-            if (entity == null) continue;
-
-            var wrote = false;
-            foreach (var field in candidate.Fields) {
-                object value;
-                try {
-                    value = field.GetValue(entity);
-                }
-                catch {
-                    continue;
-                }
-
-                string formatted;
-                if (!TryFormatValue(value, out formatted)) continue;
-
-                if (!wrote) {
-                    if (builder.Length > 0) builder.Append(" || ");
-                    builder.Append(entity.Id.Value)
-                        .Append(':')
-                        .Append(entity.GetType().FullName);
-                    wrote = true;
-                }
-                builder.Append('|').Append(field.Name).Append('=').Append(formatted);
-            }
+        updates = null;
+        error = null;
+        if (codec == null) {
+            error = "state codec is unavailable";
+            return false;
         }
 
-        if (builder.Length == 0) return false;
-        var current = builder.ToString();
-        if (string.Equals(current, m_lastObservation, StringComparison.Ordinal)) return false;
+        RefreshIfNeeded();
+        if (m_candidates.Count == 0) return true;
 
-        m_lastObservation = current;
-        observation = current;
+        foreach (var pair in m_candidates) {
+            var candidate = pair.Value;
+            object value;
+            try {
+                value = candidate.ProvidedProductField.GetValue(candidate.Entity);
+            }
+            catch (Exception ex) {
+                error = "read source " + pair.Key + " failed: " + ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
+
+            byte[] payload;
+            string serializeError;
+            if (!codec.TrySerializeValue(
+                    value,
+                    candidate.ProvidedProductField.FieldType,
+                    out payload,
+                    out serializeError)) {
+
+                error = "serialize source " + pair.Key + " failed: " + serializeError;
+                return false;
+            }
+
+            if (!candidate.HasBaseline) {
+                candidate.LastPayload = payload;
+                candidate.HasBaseline = true;
+                continue;
+            }
+
+            if (BytesEqual(candidate.LastPayload, payload)) continue;
+
+            candidate.LastPayload = payload;
+            if (updates == null) updates = new List<LocalUpdate>();
+            updates.Add(new LocalUpdate(pair.Key, payload));
+        }
+
         return true;
     }
 
-    private static bool LooksLikeSandboxSource(Type type) {
-        var name = type?.FullName ?? string.Empty;
-        return name.IndexOf("sandbox", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("source", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("generator", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("infinite", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("infinity", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("creative", StringComparison.OrdinalIgnoreCase) >= 0
-            || name.IndexOf("cheat", StringComparison.OrdinalIgnoreCase) >= 0;
+    public bool TryApplyRemote(
+        int entityId,
+        byte[] valuePayload,
+        CommandRoundTripProbe codec,
+        out string error) {
+
+        error = null;
+        if (codec == null) {
+            error = "state codec is unavailable";
+            return false;
+        }
+        if (valuePayload == null) {
+            error = "remote source payload is null";
+            return false;
+        }
+
+        RefreshIfNeeded();
+
+        Candidate candidate;
+        if (!m_candidates.TryGetValue(entityId, out candidate)) {
+            // Entity count can occasionally be observed before our local cache was
+            // rebuilt; force one scan by invalidating the count and retry once.
+            m_lastKnownEntityCount = -1;
+            RefreshIfNeeded();
+            if (!m_candidates.TryGetValue(entityId, out candidate)) {
+                error = "sandbox source entity " + entityId + " was not found";
+                return false;
+            }
+        }
+
+        object decoded;
+        string deserializeError;
+        if (!codec.TryDeserializeValue(
+                valuePayload,
+                candidate.ProvidedProductField.FieldType,
+                out decoded,
+                out deserializeError)) {
+
+            error = "deserialize source " + entityId + " failed: " + deserializeError;
+            return false;
+        }
+
+        try {
+            candidate.ProvidedProductField.SetValue(candidate.Entity, decoded);
+            // Prevent the remote application from being echoed back as a local
+            // change on the next sample.
+            candidate.LastPayload = (byte[])valuePayload.Clone();
+            candidate.HasBaseline = true;
+            return true;
+        }
+        catch (Exception ex) {
+            error = "apply source " + entityId + " failed: " + ex.GetType().Name + ": " + ex.Message;
+            return false;
+        }
     }
 
-    private static bool HasStrongSourceField(FieldInfo[] fields) {
-        foreach (var field in fields) {
-            var name = field.Name ?? string.Empty;
-            if (name.IndexOf("material", StringComparison.OrdinalIgnoreCase) >= 0
-                || name.IndexOf("outputProduct", StringComparison.OrdinalIgnoreCase) >= 0
-                || name.IndexOf("sourceProduct", StringComparison.OrdinalIgnoreCase) >= 0
-                || name.IndexOf("generatedProduct", StringComparison.OrdinalIgnoreCase) >= 0) {
+    private bool EnsureEntitiesManager() {
+        if (m_entities != null) return true;
+
+        EntitiesManager entities;
+        if (!m_resolver.TryGetResolvedDependency<EntitiesManager>(out entities) || entities == null) {
+            return false;
+        }
+        m_entities = entities;
+        return true;
+    }
+
+    private FieldInfo GetProvidedProductField(Type type) {
+        FieldInfo cached;
+        if (m_fieldByType.TryGetValue(type, out cached)) return cached;
+        if (m_typesWithoutField.Contains(type)) return null;
+
+        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
+            var field = current.GetField(
+                ProvidedProductBackingField,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (field == null || field.IsStatic) continue;
+
+            m_fieldByType[type] = field;
+            return field;
+        }
+
+        m_typesWithoutField.Add(type);
+        return null;
+    }
+
+    private static bool IsProductsSourceType(Type type) {
+        if (type == null) return false;
+        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
+            if (string.Equals(current.FullName, ProductsSourceTypeName, StringComparison.Ordinal)) {
                 return true;
             }
         }
         return false;
     }
 
-    private static FieldInfo[] GetInterestingFields(Type type) {
-        var result = new List<FieldInfo>();
-        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            foreach (var field in current.GetFields(
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
-
-                if (field.IsStatic || typeof(Delegate).IsAssignableFrom(field.FieldType)) continue;
-                var combined = (field.Name ?? string.Empty) + " " + (field.FieldType?.FullName ?? string.Empty);
-                if (combined.IndexOf("product", StringComparison.OrdinalIgnoreCase) < 0
-                    && combined.IndexOf("material", StringComparison.OrdinalIgnoreCase) < 0
-                    && combined.IndexOf("resource", StringComparison.OrdinalIgnoreCase) < 0
-                    && combined.IndexOf("output", StringComparison.OrdinalIgnoreCase) < 0
-                    && combined.IndexOf("proto", StringComparison.OrdinalIgnoreCase) < 0
-                    && combined.IndexOf("selected", StringComparison.OrdinalIgnoreCase) < 0
-                    && combined.IndexOf("enabled", StringComparison.OrdinalIgnoreCase) < 0
-                    && combined.IndexOf("active", StringComparison.OrdinalIgnoreCase) < 0) {
-                    continue;
-                }
-                result.Add(field);
-            }
+    private static bool BytesEqual(byte[] left, byte[] right) {
+        if (ReferenceEquals(left, right)) return true;
+        if (left == null || right == null || left.Length != right.Length) return false;
+        for (var i = 0; i < left.Length; i++) {
+            if (left[i] != right[i]) return false;
         }
-
-        result.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
-        return result.ToArray();
-    }
-
-    private static bool TryFormatValue(object value, out string formatted) {
-        formatted = null;
-        if (value == null) {
-            formatted = "null";
-            return true;
-        }
-
-        var type = value.GetType();
-        if (value is string || value is bool || value is char || type.IsPrimitive || type.IsEnum || type.IsValueType) {
-            try {
-                formatted = value.ToString();
-                return formatted != null && formatted.Length <= 200;
-            }
-            catch {
-                return false;
-            }
-        }
-
-        object id;
-        if (TryReadId(value, out id)) {
-            formatted = type.Name + "#" + (id ?? "null");
-            return true;
-        }
-        return false;
-    }
-
-    private static bool TryReadId(object value, out object id) {
-        id = null;
-        if (value == null) return false;
-
-        var names = new[] { "Id", "ID", "ProtoId", "PrototypeId", "m_id" };
-        var type = value.GetType();
-        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            foreach (var field in current.GetFields(
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
-                for (var i = 0; i < names.Length; i++) {
-                    if (!string.Equals(field.Name, names[i], StringComparison.Ordinal)) continue;
-                    try {
-                        id = field.GetValue(value);
-                        return true;
-                    }
-                    catch {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        foreach (var property in type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
-            if (property.GetIndexParameters().Length != 0 || property.GetGetMethod(true) == null) continue;
-            for (var i = 0; i < names.Length; i++) {
-                if (!string.Equals(property.Name, names[i], StringComparison.Ordinal)) continue;
-                try {
-                    id = property.GetValue(value, null);
-                    return true;
-                }
-                catch {
-                    return false;
-                }
-            }
-        }
-        return false;
+        return true;
     }
 }
