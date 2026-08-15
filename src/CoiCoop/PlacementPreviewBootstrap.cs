@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using CoiCoop.Networking;
 using Mafi;
@@ -7,13 +8,19 @@ using Mafi.Core.Simulation;
 namespace CoiCoop;
 
 /// <summary>
-/// Development bootstrap for real-time remote placement previews plus targeted
-/// discovery of sandbox source state that bypasses InputScheduler.
+/// Auxiliary co-op sidecar for presentation-only placement telemetry and the
+/// targeted sandbox ProductsSource state adapter.
+///
+/// The sidecar is deliberately independent from authoritative replay: failures
+/// here are logged but never halt simulation.
 /// </summary>
 internal sealed class PlacementPreviewBootstrap : IDisposable {
-    private const int SampleIntervalMs = 100;
-    private const int SandboxSampleIntervalMs = 250;
-    private const int MaxLoggedObservationChars = 900;
+    private const int PlacementSampleIntervalMs = 100;
+    private const int SandboxSampleIntervalMs = 100;
+    private const int MaxLoggedObservationChars = 700;
+    private const string PlacementKind = "PLACEMENT_DELTA";
+    private const string SandboxKind = "SANDBOX_SOURCE";
+
     private static readonly object s_lock = new object();
     private static PlacementPreviewBootstrap s_current;
 
@@ -22,14 +29,16 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private readonly int m_previewPort;
     private PlacementPreviewDiscovery m_discovery;
     private SandboxSourceDiscovery m_sandboxDiscovery;
+    private CommandRoundTripProbe m_stateCodec;
     private PlacementPreviewSession m_session;
     private ISimLoopEvents m_simLoop;
-    private int m_lastSampleMs;
+    private int m_lastPlacementSampleMs;
     private int m_lastSandboxSampleMs;
     private int m_lastLoggedCandidateCount = -1;
     private int m_lastLoggedSandboxCandidateCount = -1;
     private bool m_hooked;
     private bool m_resolverObserved;
+    private bool m_sandboxFailureLogged;
 
     private PlacementPreviewBootstrap(DependencyResolver resolver, int mode, int previewPort) {
         m_resolver = resolver;
@@ -57,14 +66,13 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private void Start() {
         m_discovery = new PlacementPreviewDiscovery(m_resolver);
         m_sandboxDiscovery = new SandboxSourceDiscovery(m_resolver);
+        m_stateCodec = new CommandRoundTripProbe(m_resolver);
         m_session = new PlacementPreviewSession(
             m_mode == 1,
             m_previewPort,
             message => Log.Info("COI-Coop: " + message));
         m_session.Start();
 
-        // Keep observing resolver objects for the whole session. Placement/input UI
-        // controllers can be instantiated well after mod initialization.
         m_resolver.ObjectInstantiated += OnObjectInstantiated;
         m_resolverObserved = true;
 
@@ -82,13 +90,11 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         if (instance == null) return;
 
         var simLoop = instance as ISimLoopEvents;
-        if (simLoop != null) {
-            Attach(simLoop);
-        }
+        if (simLoop != null) Attach(simLoop);
 
         if (m_discovery != null && m_discovery.ObserveInstance(instance)) {
             Log.Info(
-                "COI-Coop: PREVIEW discovered runtime candidate "
+                "COI-Coop: PREVIEW targeted candidate "
                 + instance.GetType().FullName);
         }
     }
@@ -98,7 +104,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_simLoop = simLoop;
         m_simLoop.UpdateEndForUi.AddNonSaveable(this, OnUpdateEndForUi);
         m_hooked = true;
-        Log.Info("COI-Coop: PREVIEW UpdateEndForUi sampler attached");
+        Log.Info("COI-Coop: PREVIEW lightweight UpdateEndForUi sampler attached");
     }
 
     private void OnUpdateEndForUi() {
@@ -114,56 +120,109 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private void SamplePlacementPreview() {
         if (m_discovery == null) return;
 
-        var changed = m_discovery.RefreshResolvedCandidates();
-        if (changed || m_lastLoggedCandidateCount != m_discovery.CandidateCount) {
+        var changedCandidates = m_discovery.RefreshResolvedCandidates();
+        if (changedCandidates || m_lastLoggedCandidateCount != m_discovery.CandidateCount) {
             m_lastLoggedCandidateCount = m_discovery.CandidateCount;
             Log.Info(
-                "COI-Coop: PREVIEW discovery candidates=" + m_discovery.CandidateCount
-                + " [" + m_discovery.CandidateSummary + "]");
+                "COI-Coop: PREVIEW targeted candidates=" + m_discovery.CandidateCount
+                + " [" + Truncate(m_discovery.CandidateSummary) + "]");
         }
 
         var now = Environment.TickCount;
-        if (unchecked(now - m_lastSampleMs) < SampleIntervalMs) return;
-        m_lastSampleMs = now;
+        if (unchecked(now - m_lastPlacementSampleMs) < PlacementSampleIntervalMs) return;
+        m_lastPlacementSampleMs = now;
 
         string observation;
         if (!m_discovery.TryCaptureChanged(out observation)) return;
 
         var payload = Encoding.UTF8.GetBytes(observation);
-        var revision = m_session.Publish("PLACEMENT_DISCOVERY", payload);
+        var revision = m_session.Publish(PlacementKind, payload);
         Log.Info(
-            "COI-Coop: PREVIEW TX rev=" + revision
+            "COI-Coop: PREVIEW DELTA TX rev=" + revision
             + " bytes=" + payload.Length
             + " " + Truncate(observation));
     }
 
     private void SampleSandboxSources() {
-        if (m_sandboxDiscovery == null) return;
+        if (m_sandboxDiscovery == null || m_stateCodec == null) return;
 
         var now = Environment.TickCount;
         if (unchecked(now - m_lastSandboxSampleMs) < SandboxSampleIntervalMs) return;
         m_lastSandboxSampleMs = now;
 
-        var changedCandidates = m_sandboxDiscovery.Refresh();
+        var changedCandidates = m_sandboxDiscovery.RefreshIfNeeded();
         if (changedCandidates || m_lastLoggedSandboxCandidateCount != m_sandboxDiscovery.CandidateCount) {
             m_lastLoggedSandboxCandidateCount = m_sandboxDiscovery.CandidateCount;
             Log.Info(
-                "COI-Coop: SANDBOX discovery candidates=" + m_sandboxDiscovery.CandidateCount
-                + " [" + Truncate(m_sandboxDiscovery.CandidateSummary) + "]");
+                "COI-Coop: SANDBOX targeted ProductsSource candidates="
+                + m_sandboxDiscovery.CandidateCount);
         }
 
-        string observation;
-        if (!m_sandboxDiscovery.TryCaptureChanged(out observation)) return;
-        Log.Info("COI-Coop: SANDBOX STATE " + Truncate(observation));
+        List<SandboxSourceDiscovery.LocalUpdate> updates;
+        string error;
+        if (!m_sandboxDiscovery.TryCaptureChanges(m_stateCodec, out updates, out error)) {
+            if (!m_sandboxFailureLogged) {
+                m_sandboxFailureLogged = true;
+                Log.Info("COI-Coop: SANDBOX SYNC CAPTURE FAIL - " + error);
+            }
+            return;
+        }
+
+        m_sandboxFailureLogged = false;
+        if (updates == null) return;
+
+        foreach (var update in updates) {
+            var wirePayload = BuildSandboxWirePayload(update.EntityId, update.ValuePayload);
+            var revision = m_session.PublishReliable(SandboxKind, wirePayload);
+            Log.Info(
+                "COI-Coop: SANDBOX SYNC TX rev=" + revision
+                + " entity=" + update.EntityId
+                + " bytes=" + update.ValuePayload.Length);
+        }
     }
 
     private void PumpIncoming() {
+        PlacementPreviewState reliable;
+        while (m_session.TryDequeueReliablePeerState(out reliable)) {
+            if (reliable == null || !string.Equals(reliable.Kind, SandboxKind, StringComparison.Ordinal)) {
+                continue;
+            }
+
+            int entityId;
+            byte[] valuePayload;
+            if (!TryParseSandboxWirePayload(reliable.Payload, out entityId, out valuePayload)) {
+                Log.Info("COI-Coop: SANDBOX SYNC RX malformed rev=" + reliable.Revision);
+                continue;
+            }
+
+            string error;
+            if (m_sandboxDiscovery == null
+                || m_stateCodec == null
+                || !m_sandboxDiscovery.TryApplyRemote(entityId, valuePayload, m_stateCodec, out error)) {
+
+                Log.Info(
+                    "COI-Coop: SANDBOX SYNC RX FAIL rev=" + reliable.Revision
+                    + " entity=" + entityId
+                    + " error=" + error);
+                continue;
+            }
+
+            Log.Info(
+                "COI-Coop: SANDBOX SYNC RX/APPLIED rev=" + reliable.Revision
+                + " entity=" + entityId
+                + " bytes=" + valuePayload.Length);
+        }
+
         PlacementPreviewState peer;
         while (m_session.TryTakeLatestPeerState(out peer)) {
             if (peer == null) continue;
 
             if (string.Equals(peer.Kind, "NONE", StringComparison.Ordinal)) {
                 Log.Info("COI-Coop: PREVIEW RX CLEAR rev=" + peer.Revision);
+                continue;
+            }
+
+            if (!string.Equals(peer.Kind, PlacementKind, StringComparison.Ordinal)) {
                 continue;
             }
 
@@ -176,11 +235,38 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             }
 
             Log.Info(
-                "COI-Coop: PREVIEW RX rev=" + peer.Revision
-                + " kind=" + peer.Kind
+                "COI-Coop: PREVIEW DELTA RX rev=" + peer.Revision
                 + " bytes=" + (peer.Payload?.Length ?? 0)
                 + " " + Truncate(observation));
         }
+    }
+
+    private static byte[] BuildSandboxWirePayload(int entityId, byte[] valuePayload) {
+        valuePayload = valuePayload ?? Array.Empty<byte>();
+        var payload = new byte[4 + valuePayload.Length];
+        var idBytes = BitConverter.GetBytes(entityId);
+        Buffer.BlockCopy(idBytes, 0, payload, 0, 4);
+        if (valuePayload.Length > 0) {
+            Buffer.BlockCopy(valuePayload, 0, payload, 4, valuePayload.Length);
+        }
+        return payload;
+    }
+
+    private static bool TryParseSandboxWirePayload(
+        byte[] payload,
+        out int entityId,
+        out byte[] valuePayload) {
+
+        entityId = 0;
+        valuePayload = null;
+        if (payload == null || payload.Length < 4) return false;
+
+        entityId = BitConverter.ToInt32(payload, 0);
+        valuePayload = new byte[payload.Length - 4];
+        if (valuePayload.Length > 0) {
+            Buffer.BlockCopy(payload, 4, valuePayload, 0, valuePayload.Length);
+        }
+        return true;
     }
 
     private static string Truncate(string value) {
@@ -204,6 +290,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_session = null;
         m_discovery = null;
         m_sandboxDiscovery = null;
+        m_stateCodec = null;
         m_simLoop = null;
         m_hooked = false;
     }
