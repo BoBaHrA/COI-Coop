@@ -29,22 +29,31 @@ internal sealed class SandboxSourceDiscovery {
     private sealed class Candidate {
         public IEntity Entity { get; }
         public FieldInfo ProvidedProductField { get; }
+        public PropertyInfo ProvidedProductProperty { get; }
         public string LastComparable { get; set; }
         public bool HasBaseline { get; set; }
 
-        public Candidate(IEntity entity, FieldInfo providedProductField) {
+        public Candidate(
+            IEntity entity,
+            FieldInfo providedProductField,
+            PropertyInfo providedProductProperty) {
+
             Entity = entity;
             ProvidedProductField = providedProductField;
+            ProvidedProductProperty = providedProductProperty;
         }
     }
 
     private const string ProductsSourceTypeName = "Mafi.Base.Prototypes.Sandbox.ProductsSourceEntity";
     private const string ProvidedProductBackingField = "<ProvidedProduct>k__BackingField";
+    private const string ProvidedProductPropertyName = "ProvidedProduct";
 
     private readonly DependencyResolver m_resolver;
     private readonly Dictionary<int, Candidate> m_candidates = new Dictionary<int, Candidate>();
     private readonly Dictionary<Type, FieldInfo> m_fieldByType = new Dictionary<Type, FieldInfo>();
+    private readonly Dictionary<Type, PropertyInfo> m_propertyByType = new Dictionary<Type, PropertyInfo>();
     private readonly HashSet<Type> m_typesWithoutField = new HashSet<Type>();
+    private readonly HashSet<Type> m_typesWithoutProperty = new HashSet<Type>();
     private EntitiesManager m_entities;
     private int m_lastKnownEntityCount = -1;
 
@@ -71,17 +80,13 @@ internal sealed class SandboxSourceDiscovery {
             var field = GetProvidedProductField(type);
             if (field == null) continue;
 
-            m_candidates.Add(entity.Id.Value, new Candidate(entity, field));
+            var property = GetProvidedProductProperty(type);
+            m_candidates.Add(entity.Id.Value, new Candidate(entity, field, property));
         }
 
         return before != m_candidates.Count;
     }
 
-    /// <summary>
-    /// Reads one field per sandbox source. Value serialization happens only after
-    /// its cheap stable textual representation changed, so the normal steady-state
-    /// path performs no BlobWriter allocations at all.
-    /// </summary>
     public bool TryCaptureChanges(
         CommandRoundTripProbe codec,
         out List<LocalUpdate> updates,
@@ -178,10 +183,22 @@ internal sealed class SandboxSourceDiscovery {
         }
 
         try {
-            candidate.ProvidedProductField.SetValue(candidate.Entity, decoded);
+            var setter = candidate.ProvidedProductProperty?.GetSetMethod(true);
+            if (setter != null) {
+                setter.Invoke(candidate.Entity, new[] { decoded });
+            }
+            else {
+                candidate.ProvidedProductField.SetValue(candidate.Entity, decoded);
+            }
+
             candidate.LastComparable = SafeComparable(decoded);
             candidate.HasBaseline = true;
             return true;
+        }
+        catch (TargetInvocationException ex) {
+            var inner = ex.InnerException ?? ex;
+            error = "apply source " + entityId + " failed: " + inner.GetType().Name + ": " + inner.Message;
+            return false;
         }
         catch (Exception ex) {
             error = "apply source " + entityId + " failed: " + ex.GetType().Name + ": " + ex.Message;
@@ -216,6 +233,29 @@ internal sealed class SandboxSourceDiscovery {
         }
 
         m_typesWithoutField.Add(type);
+        return null;
+    }
+
+    private PropertyInfo GetProvidedProductProperty(Type type) {
+        PropertyInfo cached;
+        if (m_propertyByType.TryGetValue(type, out cached)) return cached;
+        if (m_typesWithoutProperty.Contains(type)) return null;
+
+        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
+            foreach (var property in current.GetProperties(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
+
+                if (!string.Equals(property.Name, ProvidedProductPropertyName, StringComparison.Ordinal)
+                    || property.GetIndexParameters().Length != 0) {
+                    continue;
+                }
+
+                m_propertyByType[type] = property;
+                return property;
+            }
+        }
+
+        m_typesWithoutProperty.Add(type);
         return null;
     }
 
