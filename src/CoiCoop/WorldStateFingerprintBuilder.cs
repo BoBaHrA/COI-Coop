@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
 using CoiCoop.Networking;
+using Mafi;
 using Mafi.Core;
 using Mafi.Core.Entities;
 
