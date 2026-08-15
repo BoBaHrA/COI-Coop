@@ -118,7 +118,10 @@ internal sealed class WorldStateFingerprintBuilder {
             foreach (var field in current.GetFields(
                 BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
 
-                if (field.IsStatic || field.IsNotSerialized || typeof(Delegate).IsAssignableFrom(field.FieldType)) {
+                if (field.IsStatic
+                    || field.IsNotSerialized
+                    || typeof(Delegate).IsAssignableFrom(field.FieldType)
+                    || !CanHashDeclaredType(field.FieldType, 0)) {
                     continue;
                 }
                 fields.Add(field);
@@ -135,6 +138,41 @@ internal sealed class WorldStateFingerprintBuilder {
         cached = fields.ToArray();
         m_entityFieldCache[type] = cached;
         return cached;
+    }
+
+    private bool CanHashDeclaredType(Type type, int depth) {
+        if (type == null || depth > MaxValueDepth) {
+            return false;
+        }
+
+        if (type == typeof(string)
+            || type == typeof(bool)
+            || type == typeof(char)
+            || type == typeof(float)
+            || type == typeof(double)
+            || type == typeof(decimal)
+            || type == typeof(DateTime)
+            || type == typeof(TimeSpan)
+            || type == typeof(Guid)
+            || type.IsEnum
+            || IsIntegral(type)) {
+            return true;
+        }
+
+        if (type.IsValueType) {
+            foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
+                if (field.IsStatic || field.IsNotSerialized) {
+                    continue;
+                }
+                if (CanHashDeclaredType(field.FieldType, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        MemberInfo ignored;
+        return TryGetStableIdMember(type, out ignored);
     }
 
     private bool TryAppendStableValue(ref ulong hash, object value, int depth) {
@@ -201,7 +239,9 @@ internal sealed class WorldStateFingerprintBuilder {
             Array.Sort(fields, (a, b) => string.CompareOrdinal(a.Name, b.Name));
             var any = false;
             foreach (var field in fields) {
-                if (field.IsStatic || field.IsNotSerialized) {
+                if (field.IsStatic
+                    || field.IsNotSerialized
+                    || !CanHashDeclaredType(field.FieldType, depth + 1)) {
                     continue;
                 }
 
