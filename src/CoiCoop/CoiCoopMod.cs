@@ -16,6 +16,8 @@ namespace CoiCoop;
 
 public sealed class CoiCoopMod : IMod {
     private const int AuthorityFrameWaitTimeoutMs = 5000;
+    private const int StateProbeIntervalFrames = 120;
+    private const int StateProbeRetentionFrames = 2400;
 
     private sealed class ReplayMarker {
         public IInputCommand Command { get; }
@@ -40,6 +42,7 @@ public sealed class CoiCoopMod : IMod {
     private InputScheduler m_scheduler;
     private ISimLoopEvents m_simLoop;
     private CommandRoundTripProbe m_roundTripProbe;
+    private WorldStateFingerprintBuilder m_worldStateFingerprintBuilder;
     private PersistentCommandSession m_networkSession;
     private FieldInfo m_commandsToProcessField;
     private readonly HashSet<string> m_preprocessSeenTypes = new HashSet<string>(StringComparer.Ordinal);
@@ -48,6 +51,11 @@ public sealed class CoiCoopMod : IMod {
     private readonly Dictionary<long, IInputCommand> m_pendingLocalReplay = new Dictionary<long, IInputCommand>();
     private readonly SortedDictionary<long, List<ReceivedAuthorityCommand>> m_pendingAuthorityFrames
         = new SortedDictionary<long, List<ReceivedAuthorityCommand>>();
+    private readonly Dictionary<long, StateProbeSnapshot> m_localStateProbes
+        = new Dictionary<long, StateProbeSnapshot>();
+    private readonly Dictionary<long, StateProbeSnapshot> m_peerStateProbes
+        = new Dictionary<long, StateProbeSnapshot>();
+    private readonly HashSet<long> m_comparedStateProbeFrames = new HashSet<long>();
     private bool m_preprocessPassthroughConfirmed;
     private bool m_preprocessFailureLogged;
     private bool m_authoritativeReplayEnabled;
@@ -57,11 +65,14 @@ public sealed class CoiCoopMod : IMod {
     private bool m_nextBeforeCmdProcIsOuterInitial = true;
     private bool m_gameplayReadyLogged;
     private bool m_hostWaitingForClientReadyLogged;
+    private bool m_stateProbeCaptureFailureLogged;
     private long m_nextExpectedAuthoritySequence;
     private long m_nextClientAuthorityFrame;
     private long m_currentAuthorityFrame = -1;
     private long m_lastCompletedAuthorityFrame = -1;
     private long m_lastFrameProbeLog = -1;
+    private long m_lastStateProbeFrame = -1;
+    private int m_stateMismatchStreak;
     private bool m_gameHooksAttached;
     private int m_networkStarted;
 
@@ -93,6 +104,7 @@ public sealed class CoiCoopMod : IMod {
     public void Initialize(DependencyResolver resolver, bool gameWasLoaded) {
         m_resolver = resolver;
         m_roundTripProbe = new CommandRoundTripProbe(resolver);
+        m_worldStateFingerprintBuilder = new WorldStateFingerprintBuilder(resolver);
         Log.Info("COI-Coop: Initialize; gameWasLoaded=" + gameWasLoaded);
 
         InputScheduler scheduler;
@@ -253,6 +265,8 @@ public sealed class CoiCoopMod : IMod {
             m_lastCompletedAuthorityFrame,
             m_nextExpectedAuthoritySequence - 1);
         CheckPeerFrameProgress();
+        MaybeCaptureAndSendStateProbe();
+        PumpAndCompareStateProbes();
     }
 
     private void RunPreprocessPassthrough(Lyst<IInputCommand> commands) {
@@ -578,6 +592,147 @@ public sealed class CoiCoopMod : IMod {
         }
     }
 
+    private void MaybeCaptureAndSendStateProbe() {
+        if (m_networkSession == null
+            || m_worldStateFingerprintBuilder == null
+            || m_simLoop == null
+            || m_lastCompletedAuthorityFrame < 0
+            || m_lastCompletedAuthorityFrame == m_lastStateProbeFrame
+            || (m_lastCompletedAuthorityFrame != 0
+                && m_lastCompletedAuthorityFrame % StateProbeIntervalFrames != 0)) {
+            return;
+        }
+
+        m_lastStateProbeFrame = m_lastCompletedAuthorityFrame;
+        var sequence = m_nextExpectedAuthoritySequence - 1;
+        var simulationStep = m_simLoop.CurrentStep.Value;
+
+        StateProbeSnapshot probe;
+        string error;
+        if (!m_worldStateFingerprintBuilder.TryCapture(
+                m_lastCompletedAuthorityFrame,
+                sequence,
+                simulationStep,
+                out probe,
+                out error)) {
+
+            if (!m_stateProbeCaptureFailureLogged) {
+                m_stateProbeCaptureFailureLogged = true;
+                Log.Info("COI-Coop: STATE PROBE CAPTURE FAIL - " + error);
+            }
+            return;
+        }
+
+        m_stateProbeCaptureFailureLogged = false;
+        m_localStateProbes[probe.AuthorityFrame] = probe;
+        m_networkSession.ReportStateProbe(probe);
+
+        Log.Info(
+            "COI-Coop: STATE PROBE local frame=" + probe.AuthorityFrame
+            + " seq=" + probe.AuthoritySequence
+            + " step=" + probe.SimulationStep
+            + " entities=" + probe.EntityCount
+            + " idHash=" + probe.EntityIdHash.ToString("X16")
+            + " stateHash=" + probe.EntityStateHash.ToString("X16")
+            + " members=" + probe.HashedMemberCount);
+
+        CompareStateProbe(probe.AuthorityFrame);
+        TrimStateProbeHistory();
+    }
+
+    private void PumpAndCompareStateProbes() {
+        if (m_networkSession == null) {
+            return;
+        }
+
+        StateProbeSnapshot peerProbe;
+        while (m_networkSession.TryDequeueStateProbe(out peerProbe)) {
+            if (peerProbe == null || peerProbe.AuthorityFrame < 0) {
+                continue;
+            }
+
+            m_peerStateProbes[peerProbe.AuthorityFrame] = peerProbe;
+            CompareStateProbe(peerProbe.AuthorityFrame);
+        }
+
+        TrimStateProbeHistory();
+    }
+
+    private void CompareStateProbe(long authorityFrame) {
+        if (m_comparedStateProbeFrames.Contains(authorityFrame)) {
+            return;
+        }
+
+        StateProbeSnapshot local;
+        StateProbeSnapshot peer;
+        if (!m_localStateProbes.TryGetValue(authorityFrame, out local)
+            || !m_peerStateProbes.TryGetValue(authorityFrame, out peer)) {
+            return;
+        }
+
+        m_comparedStateProbeFrames.Add(authorityFrame);
+
+        if (!local.SameCoordinate(peer)) {
+            Log.Info(
+                "COI-Coop: STATE PROBE PHASE SKIP frame=" + authorityFrame
+                + " localSeq=" + local.AuthoritySequence
+                + " peerSeq=" + peer.AuthoritySequence
+                + " localStep=" + local.SimulationStep
+                + " peerStep=" + peer.SimulationStep);
+            return;
+        }
+
+        if (local.SameWorldFingerprint(peer)) {
+            if (m_stateMismatchStreak > 0) {
+                Log.Info(
+                    "COI-Coop: STATE PROBE RECOVERED frame=" + authorityFrame
+                    + " previousMismatchStreak=" + m_stateMismatchStreak);
+            }
+            m_stateMismatchStreak = 0;
+            Log.Info(
+                "COI-Coop: STATE PROBE MATCH frame=" + authorityFrame
+                + " step=" + local.SimulationStep
+                + " entities=" + local.EntityCount
+                + " stateHash=" + local.EntityStateHash.ToString("X16"));
+            return;
+        }
+
+        m_stateMismatchStreak++;
+        Log.Info(
+            "COI-Coop: STATE DESYNC SUSPECTED frame=" + authorityFrame
+            + " streak=" + m_stateMismatchStreak
+            + " " + local.Diff(peer)
+            + (m_stateMismatchStreak >= 2
+                ? " [PERSISTENT - investigate out-of-band state mutation]"
+                : " [observe next probe before treating as persistent]"));
+    }
+
+    private void TrimStateProbeHistory() {
+        if (m_lastCompletedAuthorityFrame < StateProbeRetentionFrames) {
+            return;
+        }
+
+        var cutoff = m_lastCompletedAuthorityFrame - StateProbeRetentionFrames;
+        RemoveOlderStateProbeKeys(m_localStateProbes, cutoff);
+        RemoveOlderStateProbeKeys(m_peerStateProbes, cutoff);
+        m_comparedStateProbeFrames.RemoveWhere(frame => frame < cutoff);
+    }
+
+    private static void RemoveOlderStateProbeKeys(
+        Dictionary<long, StateProbeSnapshot> probes,
+        long cutoff) {
+
+        var stale = new List<long>();
+        foreach (var pair in probes) {
+            if (pair.Key < cutoff) {
+                stale.Add(pair.Key);
+            }
+        }
+        foreach (var key in stale) {
+            probes.Remove(key);
+        }
+    }
+
     private void SendCapturedCommandsDecodeOnly(List<IInputCommand> captured) {
         if (m_networkSession == null
             || !m_networkSession.IsConnected
@@ -750,7 +905,7 @@ public sealed class CoiCoopMod : IMod {
                 : $"COI-Coop: persistent CLIENT session connecting to 127.0.0.1:{port}");
         Log.Info(
             m_authoritativeReplayEnabled
-                ? "COI-Coop: EXPERIMENTAL AUTHORITATIVE REPLAY + OUTER FRAME BARRIER = ON"
+                ? "COI-Coop: EXPERIMENTAL AUTHORITATIVE REPLAY + OUTER FRAME BARRIER + STATE PROBE = ON"
                 : "COI-Coop: network command replay is OFF; received commands are decode-only");
     }
 
@@ -794,12 +949,16 @@ public sealed class CoiCoopMod : IMod {
         m_scheduler = null;
         m_simLoop = null;
         m_roundTripProbe = null;
+        m_worldStateFingerprintBuilder = null;
         m_commandsToProcessField = null;
         m_preprocessSeenTypes.Clear();
         m_replayBypassSeenTypes.Clear();
         m_replayMarkers.Clear();
         m_pendingLocalReplay.Clear();
         m_pendingAuthorityFrames.Clear();
+        m_localStateProbes.Clear();
+        m_peerStateProbes.Clear();
+        m_comparedStateProbeFrames.Clear();
         m_preprocessPassthroughConfirmed = false;
         m_preprocessFailureLogged = false;
         m_authoritativeReplayEnabled = false;
@@ -809,11 +968,14 @@ public sealed class CoiCoopMod : IMod {
         m_nextBeforeCmdProcIsOuterInitial = true;
         m_gameplayReadyLogged = false;
         m_hostWaitingForClientReadyLogged = false;
+        m_stateProbeCaptureFailureLogged = false;
         m_nextExpectedAuthoritySequence = 0;
         m_nextClientAuthorityFrame = 0;
         m_currentAuthorityFrame = -1;
         m_lastCompletedAuthorityFrame = -1;
         m_lastFrameProbeLog = -1;
+        m_lastStateProbeFrame = -1;
+        m_stateMismatchStreak = 0;
         m_gameHooksAttached = false;
     }
 }
