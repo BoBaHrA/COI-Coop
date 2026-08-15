@@ -166,13 +166,16 @@ internal sealed class WorldStateFingerprintBuilder {
             AppendString(ref hash, Convert.ToString(value, CultureInfo.InvariantCulture));
             return true;
         }
-        if (IsNumeric(type)) {
-            var formattable = value as IFormattable;
-            AppendString(
-                ref hash,
-                formattable != null
-                    ? formattable.ToString("R", CultureInfo.InvariantCulture)
-                    : Convert.ToString(value, CultureInfo.InvariantCulture));
+        if (value is float singleValue) {
+            AppendString(ref hash, singleValue.ToString("R", CultureInfo.InvariantCulture));
+            return true;
+        }
+        if (value is double doubleValue) {
+            AppendString(ref hash, doubleValue.ToString("R", CultureInfo.InvariantCulture));
+            return true;
+        }
+        if (IsIntegral(type)) {
+            AppendString(ref hash, Convert.ToString(value, CultureInfo.InvariantCulture));
             return true;
         }
         if (value is decimal decimalValue) {
@@ -291,7 +294,7 @@ internal sealed class WorldStateFingerprintBuilder {
         return false;
     }
 
-    private static bool IsNumeric(Type type) {
+    private static bool IsIntegral(Type type) {
         return type == typeof(byte)
             || type == typeof(sbyte)
             || type == typeof(short)
@@ -299,9 +302,7 @@ internal sealed class WorldStateFingerprintBuilder {
             || type == typeof(int)
             || type == typeof(uint)
             || type == typeof(long)
-            || type == typeof(ulong)
-            || type == typeof(float)
-            || type == typeof(double);
+            || type == typeof(ulong);
     }
 
     private static void AppendString(ref ulong hash, string value) {
