@@ -38,6 +38,22 @@ static bool TryWaitForCommand(
     return ok;
 }
 
+static bool TryWaitForStateProbe(
+    PersistentCommandSession session,
+    out StateProbeSnapshot? probe,
+    int timeoutMs = 5000) {
+
+    StateProbeSnapshot? received = null;
+    var ok = WaitUntil(() => {
+        if (!session.TryDequeueStateProbe(out var item)) return false;
+        received = item;
+        return true;
+    }, timeoutMs);
+
+    probe = received;
+    return ok;
+}
+
 static int TestAuthoritySequencing() {
     var sequencer = new AuthorityCommandSequencer();
 
@@ -213,7 +229,34 @@ static int TestPersistentCommandSession() {
         return 32;
     }
 
-    Console.WriteLine($"PASS: persistent session sealed authority frames and delivered one ordered stream on 127.0.0.1:{port}");
+    var hostProbe = new StateProbeSnapshot(
+        1, 1, 123456, 42,
+        0x1111222233334444UL,
+        0xAAAABBBBCCCCDDDDUL,
+        321);
+    var clientProbe = new StateProbeSnapshot(
+        1, 1, 123456, 42,
+        0x1111222233334444UL,
+        0xAAAABBBBCCCCDDDDUL,
+        321);
+
+    host.ReportStateProbe(hostProbe);
+    client.ReportStateProbe(clientProbe);
+
+    if (!TryWaitForStateProbe(host, out var fromClient)
+        || !TryWaitForStateProbe(client, out var fromHost)
+        || fromClient == null
+        || fromHost == null
+        || !fromClient.SameCoordinate(hostProbe)
+        || !fromClient.SameWorldFingerprint(hostProbe)
+        || !fromHost.SameCoordinate(clientProbe)
+        || !fromHost.SameWorldFingerprint(clientProbe)) {
+
+        Console.Error.WriteLine("FAIL: protocol v4 STATE probes were not exchanged losslessly.");
+        return 33;
+    }
+
+    Console.WriteLine($"PASS: persistent session sealed authority frames, exchanged progress/state probes, and delivered one ordered stream on 127.0.0.1:{port}");
     return 0;
 }
 
