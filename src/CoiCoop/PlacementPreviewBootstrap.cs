@@ -24,8 +24,9 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private PlacementPreviewSession m_session;
     private ISimLoopEvents m_simLoop;
     private int m_lastSampleMs;
+    private int m_lastLoggedCandidateCount = -1;
     private bool m_hooked;
-    private bool m_discoveryLogged;
+    private bool m_resolverObserved;
 
     private PlacementPreviewBootstrap(DependencyResolver resolver, int mode, int previewPort) {
         m_resolver = resolver;
@@ -58,12 +59,14 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             message => Log.Info("COI-Coop: " + message));
         m_session.Start();
 
+        // Keep observing resolver objects for the whole session. Placement/input UI
+        // controllers can be instantiated well after mod initialization.
+        m_resolver.ObjectInstantiated += OnObjectInstantiated;
+        m_resolverObserved = true;
+
         ISimLoopEvents simLoop;
         if (m_resolver.TryGetResolvedDependency<ISimLoopEvents>(out simLoop) && simLoop != null) {
             Attach(simLoop);
-        }
-        else {
-            m_resolver.ObjectInstantiated += OnObjectInstantiated;
         }
 
         Log.Info(
@@ -72,9 +75,18 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     }
 
     private void OnObjectInstantiated(object instance) {
-        if (!(instance is ISimLoopEvents simLoop)) return;
-        Attach(simLoop);
-        m_resolver.ObjectInstantiated -= OnObjectInstantiated;
+        if (instance == null) return;
+
+        var simLoop = instance as ISimLoopEvents;
+        if (simLoop != null) {
+            Attach(simLoop);
+        }
+
+        if (m_discovery != null && m_discovery.ObserveInstance(instance)) {
+            Log.Info(
+                "COI-Coop: PREVIEW discovered runtime candidate "
+                + instance.GetType().FullName);
+        }
     }
 
     private void Attach(ISimLoopEvents simLoop) {
@@ -91,8 +103,9 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         PumpIncoming();
         if (!m_session.IsConnected || m_discovery == null) return;
 
-        if (!m_discoveryLogged) {
-            m_discoveryLogged = true;
+        var changed = m_discovery.RefreshResolvedCandidates();
+        if (changed || m_lastLoggedCandidateCount != m_discovery.CandidateCount) {
+            m_lastLoggedCandidateCount = m_discovery.CandidateCount;
             Log.Info(
                 "COI-Coop: PREVIEW discovery candidates=" + m_discovery.CandidateCount
                 + " [" + m_discovery.CandidateSummary + "]");
@@ -152,9 +165,10 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     }
 
     public void Dispose() {
-        if (m_resolver != null) {
+        if (m_resolver != null && m_resolverObserved) {
             try { m_resolver.ObjectInstantiated -= OnObjectInstantiated; } catch { }
         }
+        m_resolverObserved = false;
         m_session?.Dispose();
         m_session = null;
         m_discovery = null;
