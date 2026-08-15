@@ -316,18 +316,30 @@ internal sealed class WorldStateFingerprintBuilder {
             }
         }
 
-        foreach (var name in names) {
-            var property = type.GetProperty(
-                name,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (property != null
-                && property.GetIndexParameters().Length == 0
-                && property.GetGetMethod(true) != null) {
+        // GetProperty(name) can throw AmbiguousMatchException when COI types hide an
+        // Id property in a derived class. Enumerate properties and pick a concrete
+        // getter instead so the diagnostic probe cannot fail on that shape.
+        foreach (var property in type.GetProperties(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
 
-                m_stableIdMemberCache[type] = property;
-                member = property;
-                return true;
+            if (property.GetIndexParameters().Length != 0 || property.GetGetMethod(true) == null) {
+                continue;
             }
+
+            var nameMatches = false;
+            for (var i = 0; i < names.Length; i++) {
+                if (string.Equals(property.Name, names[i], StringComparison.Ordinal)) {
+                    nameMatches = true;
+                    break;
+                }
+            }
+            if (!nameMatches) {
+                continue;
+            }
+
+            m_stableIdMemberCache[type] = property;
+            member = property;
+            return true;
         }
 
         m_noStableIdMember.Add(type);
