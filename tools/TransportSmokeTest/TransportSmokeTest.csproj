@@ -12,6 +12,7 @@
     <Compile Include="..\..\src\CoiCoop\Networking\AuthorityCommandEnvelope.cs" Link="Networking\AuthorityCommandEnvelope.cs" />
     <Compile Include="..\..\src\CoiCoop\Networking\AuthorityCommandSequencer.cs" Link="Networking\AuthorityCommandSequencer.cs" />
     <Compile Include="..\..\src\CoiCoop\Networking\ReceivedAuthorityCommand.cs" Link="Networking\ReceivedAuthorityCommand.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\StateProbeSnapshot.cs" Link="Networking\StateProbeSnapshot.cs" />
     <Compile Include="..\..\src\CoiCoop\Networking\PersistentCommandSession.cs" Link="Networking\PersistentCommandSession.cs" />
   </ItemGroup>
 </Project>
