@@ -13,13 +13,15 @@ namespace CoiCoop;
 ///
 /// COI 0.8.7 does not expose a generic serializer for the nested PreviewRequest
 /// structs themselves (BlobWriter fails with "Failed to create generic serializer
-/// for 'PreviewRequest'"). Their component fields are normal COI/core values that
-/// already participate in command/save serialization, so we serialize those fields
-/// individually and reconstruct the value type through its real constructor on the
-/// receiving peer.
+/// for 'PreviewRequest'"). Their component fields are serialized individually and
+/// the request value type is reconstructed through its real constructor.
+///
+/// Protocol v3 also carries the selected BridgeProto for bridge/ramp previews.
+/// PathFindingBridgePreview requires that extra context via SetStartConnectionType;
+/// unlike transport/train requests, it cannot be recovered reliably on the peer.
 /// </summary>
 internal static class PathPreviewWireCodec {
-    private const byte Version = 2;
+    private const byte Version = 3;
     private const int MaxStringBytes = 1024;
     private const int MaxFieldCount = 64;
     private const int MaxValuePayloadBytes = 1024 * 1024;
@@ -32,6 +34,7 @@ internal static class PathPreviewWireCodec {
         public Type RequestType { get; }
         public ThicknessTilesI RelativeHeight { get; }
         public string ControllerState { get; }
+        public object BridgeProto { get; }
 
         public DecodedState(
             string family,
@@ -39,7 +42,8 @@ internal static class PathPreviewWireCodec {
             object request,
             Type requestType,
             ThicknessTilesI relativeHeight,
-            string controllerState) {
+            string controllerState,
+            object bridgeProto) {
 
             Family = family;
             IsContinuation = isContinuation;
@@ -47,6 +51,7 @@ internal static class PathPreviewWireCodec {
             RequestType = requestType;
             RelativeHeight = relativeHeight;
             ControllerState = controllerState;
+            BridgeProto = bridgeProto;
         }
     }
 
@@ -100,6 +105,34 @@ internal static class PathPreviewWireCodec {
                 return false;
             }
 
+            var hasBridgeProto = state.BridgeProto != null && state.BridgeProtoType != null;
+            byte[] bridgeProtoTypeBytes = null;
+            byte[] bridgeProtoPayload = null;
+            if (hasBridgeProto) {
+                var bridgeProtoTypeName = state.BridgeProtoType.AssemblyQualifiedName
+                    ?? state.BridgeProtoType.FullName
+                    ?? string.Empty;
+                bridgeProtoTypeBytes = EncodeString(
+                    bridgeProtoTypeName,
+                    "bridge proto type",
+                    allowEmpty: false);
+
+                string bridgeProtoError;
+                if (!codec.TrySerializeValue(
+                        state.BridgeProto,
+                        state.BridgeProtoType,
+                        out bridgeProtoPayload,
+                        out bridgeProtoError)) {
+
+                    error = "BridgeProto serialization failed: " + bridgeProtoError;
+                    return false;
+                }
+                if (!ValidateValuePayload(bridgeProtoPayload)) {
+                    error = "BridgeProto payload is unexpectedly large";
+                    return false;
+                }
+            }
+
             var fields = state.RequestType
                 .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                 .Where(field => !field.IsStatic)
@@ -119,6 +152,13 @@ internal static class PathPreviewWireCodec {
                 WriteBytes(writer, typeNameBytes);
                 WriteBytes(writer, controllerStateBytes);
                 WriteBytes(writer, heightPayload);
+
+                writer.Write(hasBridgeProto);
+                if (hasBridgeProto) {
+                    WriteBytes(writer, bridgeProtoTypeBytes);
+                    WriteBytes(writer, bridgeProtoPayload);
+                }
+
                 writer.Write(fields.Length);
 
                 for (var i = 0; i < fields.Length; i++) {
@@ -224,6 +264,39 @@ internal static class PathPreviewWireCodec {
                     return false;
                 }
 
+                object bridgeProto = null;
+                var hasBridgeProto = reader.ReadBoolean();
+                if (hasBridgeProto) {
+                    var bridgeProtoTypeName = Encoding.UTF8.GetString(
+                        ReadBytes(reader, stream, MaxStringBytes, "bridge proto type"));
+                    var bridgeProtoPayload = ReadBytes(
+                        reader,
+                        stream,
+                        MaxValuePayloadBytes,
+                        "bridge proto payload");
+
+                    var bridgeProtoType = ResolveType(bridgeProtoTypeName);
+                    if (bridgeProtoType == null) {
+                        error = "BridgeProto type could not be resolved: " + bridgeProtoTypeName;
+                        return false;
+                    }
+
+                    string bridgeProtoError;
+                    if (!codec.TryDeserializeValue(
+                            bridgeProtoPayload,
+                            bridgeProtoType,
+                            out bridgeProto,
+                            out bridgeProtoError)) {
+
+                        error = "BridgeProto deserialization failed: " + bridgeProtoError;
+                        return false;
+                    }
+                    if (bridgeProto == null) {
+                        error = "decoded BridgeProto is null";
+                        return false;
+                    }
+                }
+
                 var fieldCount = reader.ReadInt32();
                 if (fieldCount <= 0 || fieldCount > MaxFieldCount) {
                     error = "invalid PreviewRequest field count " + fieldCount;
@@ -290,7 +363,8 @@ internal static class PathPreviewWireCodec {
                     request,
                     requestType,
                     relativeHeight,
-                    controllerState);
+                    controllerState,
+                    bridgeProto);
                 return true;
             }
         }
