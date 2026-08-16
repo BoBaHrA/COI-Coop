@@ -30,6 +30,7 @@ internal sealed class WorldStateFingerprintBuilder {
         m_resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         PlacementPreviewBootstrap.EnsureStarted(resolver);
         PathPreviewBootstrap.EnsureStarted(resolver);
+        BlueprintPreviewBootstrap.EnsureStarted(resolver);
     }
 
     public bool TryCapture(
