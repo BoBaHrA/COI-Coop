@@ -5,12 +5,15 @@ cd /d "%~dp0.."
 echo === COI-Coop TWO-PC LAN HOST ===
 echo.
 echo This keeps the proven co-op protocol on loopback and exposes
- echo development LAN tunnels on TCP 27115-27118.
+echo development LAN tunnels on TCP 27115-27118.
 echo.
 echo IMPORTANT:
 echo   1. Host and client must use byte-identical starting saves.
 echo   2. Allow Captain of Industry through Windows Firewall on Private networks.
-echo   3. Give the client this PC's LAN IPv4 address (for example 192.168.1.50).
+echo   3. Give the client one of this PC's LAN IPv4 addresses below.
+echo.
+echo LAN IPv4 candidates:
+powershell.exe -NoProfile -Command "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue ^| Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' } ^| Sort-Object InterfaceMetric ^| ForEach-Object { '  ' + $_.IPAddress + '  (' + $_.InterfaceAlias + ')' }"
 echo.
 
 set "COI_COOP_LAN=1"
