@@ -64,7 +64,7 @@ else {
         else {
             Write-Host "Save '$leaf' was not found." -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "Most recent .save files under $saveRoot:" -ForegroundColor Cyan
+            Write-Host "Most recent .save files under ${saveRoot}:" -ForegroundColor Cyan
             $allSaves | Select-Object -First 25 | ForEach-Object {
                 $relative = $_.FullName.Substring($saveRoot.Length).TrimStart('\')
                 Write-Host ("  {0}  [{1}]" -f $relative, $_.LastWriteTime)
