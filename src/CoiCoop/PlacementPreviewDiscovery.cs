@@ -12,11 +12,13 @@ namespace CoiCoop;
 /// <summary>
 /// Targeted runtime bridge for COI 0.8.7 ordinary building placement.
 ///
-/// Unlike the old diagnostic scanner, this class never walks all Unity objects and
-/// never serializes reflection dumps. It keeps only the handful of known placement
-/// controller instances. Single placements still use the proven helper transform;
-/// multi-entity mass placements read the active placer's m_entityPreviews set so
-/// drag rows / duplicated buildings / blueprints can be mirrored piece-by-piece.
+/// Single-object placement uses StaticEntityMassPlacer.m_helper.Transform, which is
+/// the live cursor transform while the placer is in single-entity mode. Drag/strip
+/// placement is different: once m_singleEntityMode becomes false the helper transform
+/// acts as the strip anchor, while the actual visual pieces are the live
+/// IStaticEntityPreview objects stored in m_entityPreviews. Multi-placement capture
+/// therefore reads transforms from the preview keys first and only falls back to
+/// EntityConfigData when necessary.
 /// </summary>
 internal sealed class PlacementPreviewDiscovery {
     private const string MassPlacerTypeName
@@ -128,13 +130,9 @@ internal sealed class PlacementPreviewDiscovery {
     }
 
     /// <summary>
-    /// Captures a multi-entity ordinary placement from StaticEntityMassPlacer.
-    /// Vanilla stores m_entityPreviews as KeyValuePair&lt;IStaticEntityPreview,
-    /// EntityConfigData&gt;. EntityConfigData carries the individual prototype and
-    /// transform that ultimately become BatchCreateStaticEntitiesCmd items.
-    ///
-    /// We only claim this path when there are at least two live preview entries;
-    /// ordinary single-object placement remains on TryCaptureBuildingGhost().
+    /// Captures a drag/strip or other multi-entity placement from the live preview
+    /// objects. The preview key is authoritative for its current visual transform;
+    /// EntityConfigData can describe the original placement and is only a fallback.
     /// </summary>
     public bool TryCaptureBuildingGhostSet(out CapturedSet state, out string error) {
         state = null;
@@ -185,13 +183,16 @@ internal sealed class PlacementPreviewDiscovery {
             }
 
             TileTransform transform = default(TileTransform);
-            var foundTransform = value != null && TryExtractTileTransform(value, out transform);
-            if (!foundTransform && key != null) {
-                foundTransform = TryExtractTileTransform(key, out transform);
+
+            // IMPORTANT: the live preview key moves via ApplyTransformDelta while
+            // dragging. EntityConfigData can remain at its original/anchor transform.
+            var foundTransform = key != null && TryExtractLivePreviewTransform(key, out transform);
+            if (!foundTransform && value != null) {
+                foundTransform = TryExtractTileTransform(value, out transform);
             }
 
             if (prototype == null || !foundTransform) {
-                error = "could not read proto/transform from mass placement preview element "
+                error = "could not read live proto/transform from mass placement preview element "
                     + item.GetType().FullName;
                 return false;
             }
@@ -200,7 +201,9 @@ internal sealed class PlacementPreviewDiscovery {
         }
 
         if (pieces.Count < 2) {
-            error = "active StaticEntityMassPlacer has fewer than two preview pieces";
+            error = IsMultiEntityMode(active.Instance)
+                ? "multi-entity mode is active but m_entityPreviews has fewer than two live pieces"
+                : "active StaticEntityMassPlacer has fewer than two preview pieces";
             return false;
         }
 
@@ -210,9 +213,9 @@ internal sealed class PlacementPreviewDiscovery {
     }
 
     /// <summary>
-    /// Captures one ordinary building ghost from the currently active
-    /// StaticEntityMassPlacer. The helper transform is deliberately retained for
-    /// the single-object path because it is the exact live cursor transform.
+    /// Captures one ordinary building ghost. Never use the helper transform while
+    /// the placer is in multi-entity/strip mode: at that point it is the strip anchor
+    /// and would leave a frozen remote ghost at the drag start position.
     /// </summary>
     public bool TryCaptureBuildingGhost(
         out Proto prototype,
@@ -226,6 +229,11 @@ internal sealed class PlacementPreviewDiscovery {
         Candidate active;
         if (!TryGetActiveMassPlacer(out active)) {
             error = "no active StaticEntityMassPlacer";
+            return false;
+        }
+
+        if (IsMultiEntityMode(active.Instance) || HasMultiplePreviewEntries(active.Instance)) {
+            error = "active StaticEntityMassPlacer is in multi-entity mode";
             return false;
         }
 
@@ -250,15 +258,49 @@ internal sealed class PlacementPreviewDiscovery {
             return true;
         }
 
-        // Version-tolerant fallback: inspect only the single active placer and at
-        // most two shallow levels looking for a Proto reference. This is tiny
-        // compared with the removed all-world reflection scanner.
-        if (TryExtractPrototype(active.Instance, 2, new HashSet<object>(ReferenceEqualityComparer.Instance), out prototype)) {
+        if (TryExtractPrototype(
+            active.Instance,
+            2,
+            new HashSet<object>(ReferenceEqualityComparer.Instance),
+            out prototype)) {
+
             transform = capturedTransform;
             return true;
         }
 
         error = "active StaticEntityMassPlacer prototype was not found";
+        return false;
+    }
+
+    private static bool IsMultiEntityMode(object placer) {
+        object singleMode;
+        if (TryReadMember(placer, "m_singleEntityMode", out singleMode)
+            && singleMode is bool isSingle) {
+            return !isSingle;
+        }
+
+        object singleModeProperty;
+        if (TryReadMember(placer, "SingleEntityMode", out singleModeProperty)
+            && singleModeProperty is bool propertySingle) {
+            return !propertySingle;
+        }
+
+        return false;
+    }
+
+    private static bool HasMultiplePreviewEntries(object placer) {
+        object previews;
+        if (!TryReadMember(placer, "m_entityPreviews", out previews) || previews == null) return false;
+
+        if (previews is ICollection collection) return collection.Count > 1;
+
+        var enumerable = previews as IEnumerable;
+        if (enumerable == null) return false;
+        var count = 0;
+        foreach (var item in enumerable) {
+            if (item == null) continue;
+            if (++count > 1) return true;
+        }
         return false;
     }
 
@@ -315,6 +357,32 @@ internal sealed class PlacementPreviewDiscovery {
         return false;
     }
 
+    private static bool TryExtractLivePreviewTransform(object preview, out TileTransform transform) {
+        transform = default(TileTransform);
+        if (preview == null) return false;
+
+        if (TryExtractTileTransform(preview, out transform)) return true;
+
+        // Some preview implementations keep their live transform one object below
+        // the interface wrapper. Keep this deliberately shallow and name-targeted so
+        // the 30 Hz sampler never turns into another expensive reflection crawler.
+        string[] nestedNames = {
+            "m_preview", "Preview",
+            "m_addRequest", "AddRequest",
+            "m_request", "Request",
+            "m_entity", "Entity"
+        };
+        for (var i = 0; i < nestedNames.Length; i++) {
+            object nested;
+            if (TryReadMember(preview, nestedNames[i], out nested)
+                && nested != null
+                && TryExtractTileTransform(nested, out transform)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static bool TryExtractTileTransform(object value, out TileTransform transform) {
         transform = default(TileTransform);
         if (value == null) return false;
@@ -323,13 +391,19 @@ internal sealed class PlacementPreviewDiscovery {
             return true;
         }
 
-        string[] preferredNames = { "Transform", "m_transform", "EntityTransform", "TileTransform" };
+        string[] preferredNames = {
+            "Transform", "m_transform", "EntityTransform", "TileTransform"
+        };
         for (var i = 0; i < preferredNames.Length; i++) {
             object memberValue;
-            if (TryReadMember(value, preferredNames[i], out memberValue)
-                && memberValue is TileTransform preferred) {
-                transform = preferred;
-                return true;
+            if (TryReadMember(value, preferredNames[i], out memberValue)) {
+                if (memberValue is TileTransform preferred) {
+                    transform = preferred;
+                    return true;
+                }
+                if (TryUnwrapNullableTileTransform(memberValue, out transform)) {
+                    return true;
+                }
             }
         }
 
@@ -353,6 +427,7 @@ internal sealed class PlacementPreviewDiscovery {
                     transform = fieldTransform;
                     return true;
                 }
+                if (TryUnwrapNullableTileTransform(fieldValue, out transform)) return true;
             }
 
             PropertyInfo[] properties;
@@ -364,8 +439,10 @@ internal sealed class PlacementPreviewDiscovery {
                 properties = Array.Empty<PropertyInfo>();
             }
             for (var i = 0; i < properties.Length; i++) {
-                if (properties[i].GetIndexParameters().Length != 0 || properties[i].GetGetMethod(true) == null) continue;
-                var propertyType = Nullable.GetUnderlyingType(properties[i].PropertyType) ?? properties[i].PropertyType;
+                if (properties[i].GetIndexParameters().Length != 0
+                    || properties[i].GetGetMethod(true) == null) continue;
+                var propertyType = Nullable.GetUnderlyingType(properties[i].PropertyType)
+                    ?? properties[i].PropertyType;
                 if (propertyType != typeof(TileTransform)) continue;
                 object propertyValue;
                 try { propertyValue = properties[i].GetValue(value, null); }
@@ -374,7 +451,29 @@ internal sealed class PlacementPreviewDiscovery {
                     transform = propertyTransform;
                     return true;
                 }
+                if (TryUnwrapNullableTileTransform(propertyValue, out transform)) return true;
             }
+        }
+        return false;
+    }
+
+    private static bool TryUnwrapNullableTileTransform(object value, out TileTransform transform) {
+        transform = default(TileTransform);
+        if (value == null) return false;
+        var type = value.GetType();
+        if (!type.IsGenericType || type.GetGenericTypeDefinition() != typeof(Nullable<>)) return false;
+        if (Nullable.GetUnderlyingType(type) != typeof(TileTransform)) return false;
+
+        object hasValue;
+        object inner;
+        if (TryReadMember(value, "HasValue", out hasValue)
+            && hasValue is bool has
+            && has
+            && TryReadMember(value, "Value", out inner)
+            && inner is TileTransform tileTransform) {
+
+            transform = tileTransform;
+            return true;
         }
         return false;
     }
@@ -395,7 +494,6 @@ internal sealed class PlacementPreviewDiscovery {
             visited.Add(value);
         }
 
-        // Handle Mafi.Option<T> and similar wrappers without knowing T.
         object hasValue;
         if (TryReadMember(value, "HasValue", out hasValue) && hasValue is bool has && has) {
             object optionValue;
@@ -495,7 +593,9 @@ internal sealed class PlacementPreviewDiscovery {
             var property = current.GetProperty(
                 name,
                 BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
-            if (property != null && property.GetIndexParameters().Length == 0 && property.GetGetMethod(true) != null) {
+            if (property != null
+                && property.GetIndexParameters().Length == 0
+                && property.GetGetMethod(true) != null) {
                 try { value = property.GetValue(instance, null); return true; }
                 catch { return false; }
             }
