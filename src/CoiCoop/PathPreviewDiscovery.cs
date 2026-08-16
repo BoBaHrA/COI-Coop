@@ -19,6 +19,7 @@ internal sealed class PathPreviewDiscovery {
     private const string TransportControllerTypeName = "Mafi.Unity.Ui.Controllers.TransportBuildController";
     private const string BridgeControllerTypeName = "Mafi.Unity.Ui.Controllers.Bridges.BridgeBuildController";
     private const string TrainControllerTypeName = "Mafi.Unity.Ui.Controllers.Trains.TrainTrackBuildController";
+    private const string BridgeProtoTypeName = "Mafi.Core.Bridges.BridgeProto";
 
     private readonly DependencyResolver m_resolver;
     private readonly Dictionary<string, object> m_controllers = new Dictionary<string, object>(StringComparer.Ordinal);
@@ -31,6 +32,8 @@ internal sealed class PathPreviewDiscovery {
         public Type RequestType { get; }
         public ThicknessTilesI RelativeHeight { get; }
         public string ControllerState { get; }
+        public object BridgeProto { get; }
+        public Type BridgeProtoType { get; }
 
         public CapturedState(
             string family,
@@ -38,7 +41,9 @@ internal sealed class PathPreviewDiscovery {
             object request,
             Type requestType,
             ThicknessTilesI relativeHeight,
-            string controllerState) {
+            string controllerState,
+            object bridgeProto,
+            Type bridgeProtoType) {
 
             Family = family;
             IsContinuation = isContinuation;
@@ -46,6 +51,8 @@ internal sealed class PathPreviewDiscovery {
             RequestType = requestType;
             RelativeHeight = relativeHeight;
             ControllerState = controllerState;
+            BridgeProto = bridgeProto;
+            BridgeProtoType = bridgeProtoType;
         }
     }
 
@@ -134,6 +141,20 @@ internal sealed class PathPreviewDiscovery {
                     ? controllerStateValue.ToString()
                     : string.Empty;
 
+            object bridgeProto = null;
+            Type bridgeProtoType = null;
+            if (string.Equals(family, BridgeFamily, StringComparison.Ordinal)) {
+                bridgeProtoType = FindLoadedType(BridgeProtoTypeName);
+                object bridgeProtoValue;
+                if (bridgeProtoType != null
+                    && TryReadMember(controller, "m_bridgeProto", out bridgeProtoValue)
+                    && bridgeProtoValue != null
+                    && bridgeProtoType.IsInstanceOfType(bridgeProtoValue)) {
+
+                    bridgeProto = bridgeProtoValue;
+                }
+            }
+
             var continuation = controllerState.IndexOf("Continuation", StringComparison.OrdinalIgnoreCase) >= 0;
             state = new CapturedState(
                 family,
@@ -141,7 +162,9 @@ internal sealed class PathPreviewDiscovery {
                 request,
                 request.GetType(),
                 relativeHeight,
-                controllerState);
+                controllerState,
+                bridgeProto,
+                bridgeProtoType);
             error = null;
             return true;
         }
