@@ -1,0 +1,29 @@
+name: Relay smoke test
+
+on:
+  pull_request:
+    paths:
+      - 'relay/**'
+      - 'render.yaml'
+      - '.github/workflows/relay-smoke-test.yml'
+  push:
+    branches:
+      - dev/network-foundation
+    paths:
+      - 'relay/**'
+      - 'render.yaml'
+      - '.github/workflows/relay-smoke-test.yml'
+
+jobs:
+  relay-smoke:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+      - run: npm run test:smoke
