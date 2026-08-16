@@ -28,9 +28,14 @@ internal sealed class WorldStateFingerprintBuilder {
 
     public WorldStateFingerprintBuilder(DependencyResolver resolver) {
         m_resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
-        // The LAN bridge must own the client-side loopback ports before any of the
-        // proven loopback sessions begin their retry loops.
+
+        // Transitional bridges must own the client-side loopback ports before any
+        // of the proven loopback sessions begin their retry loops. They are gated
+        // independently by environment variables; normal development loopback
+        // mode starts neither bridge.
+        InternetRelayBootstrap.EnsureStarted();
         LanTransportBootstrap.EnsureStarted();
+
         PlacementPreviewBootstrap.EnsureStarted(resolver);
         PathPreviewBootstrap.EnsureStarted(resolver);
         BlueprintPreviewBootstrap.EnsureStarted(resolver);
