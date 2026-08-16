@@ -4,9 +4,9 @@ using System.Collections.Generic;
 namespace CoiCoop;
 
 /// <summary>
-/// Presentation-only renderer for drag rows / duplicated ordinary placements.
-/// Each mirrored entity is an ordinary LayoutEntityPreview, so this composes the
-/// already-proven single-building renderer instead of creating simulated entities.
+/// Presentation-only renderer for composite ordinary placements (drag rows,
+/// duplicated entities, blueprints). Composite mode may legitimately contain one
+/// live preview for a frame or for a single-item blueprint.
 /// </summary>
 internal sealed class RemoteMultiPlacementGhostRenderer : IDisposable {
     private readonly Mafi.DependencyResolver m_resolver;
@@ -23,7 +23,7 @@ internal sealed class RemoteMultiPlacementGhostRenderer : IDisposable {
     }
 
     public void Publish(MultiPlacementGhostWireCodec.DecodedState state) {
-        if (state == null || state.Pieces == null || state.Pieces.Count < 2) {
+        if (state == null || state.Pieces == null || state.Pieces.Count < 1) {
             Clear();
             return;
         }
