@@ -61,6 +61,12 @@ function normalizeCode(value) {
   return raw.slice(0, 4) + '-' + raw.slice(4);
 }
 
+function bearerToken(req) {
+  const header = String(req.headers.authorization || '');
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match ? match[1].trim() : '';
+}
+
 function makeLaneState() {
   return {
     host: null,
@@ -290,7 +296,7 @@ server.on('upgrade', (req, socket, head) => {
 
     const code = normalizeCode(url.searchParams.get('code'));
     const role = String(url.searchParams.get('role') || '').toLowerCase();
-    const token = String(url.searchParams.get('token') || '');
+    const token = bearerToken(req);
     const laneIndex = Number(url.searchParams.get('lane'));
     const session = code ? sessions.get(code) : null;
 
