@@ -113,4 +113,4 @@ $env:COI_COOP_SESSION_TOKEN = $token
 
 $launcher = Join-Path $PSScriptRoot "launch-coop.ps1"
 & $launcher -Mode $Mode -CoiRoot $CoiRoot -Port $Port -Replay
-exit $LASTEXITCODE
+exit 0
