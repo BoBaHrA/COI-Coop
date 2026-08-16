@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Reflection;
 using Mafi;
 
@@ -14,6 +15,8 @@ namespace CoiCoop;
 /// future dedicated visualizer instance can remove that limitation.
 /// </summary>
 internal sealed class RemotePathGhostRenderer : IDisposable {
+    private const string BridgeProtoTypeName = "Mafi.Core.Bridges.BridgeProto";
+
     private readonly DependencyResolver m_resolver;
     private readonly Action<string> m_log;
     private readonly object m_stateLock = new object();
@@ -27,10 +30,13 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
     private MethodInfo m_activate;
     private MethodInfo m_clear;
     private MethodInfo m_deactivate;
+    private MethodInfo m_setStartConnectionType;
+    private object m_bridgeStartProto;
     private bool m_remoteActivated;
     private bool m_waitLogged;
     private bool m_failureLogged;
     private bool m_suppressedLogged;
+    private bool m_bridgeContextWaitLogged;
 
     public RemotePathGhostRenderer(DependencyResolver resolver, Action<string> log) {
         m_resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
@@ -70,6 +76,7 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
                 }
                 m_failureLogged = false;
                 m_suppressedLogged = false;
+                m_bridgeContextWaitLogged = false;
                 return;
             }
 
@@ -85,9 +92,28 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
             m_suppressedLogged = false;
 
             if (!EnsurePreview(state.Family)) return;
+
+            // Bridges have one extra piece of presentation state that transports
+            // and train tracks do not: PathFindingBridgePreview must know the
+            // BridgeProto used for the start connection. Vanilla BridgeBuildController
+            // supplies this through SetStartConnectionType(). Without it the Show*
+            // calls can succeed without producing any visible bridge geometry.
+            if (string.Equals(state.Family, PathPreviewDiscovery.BridgeFamily, StringComparison.Ordinal)
+                && !PrepareBridgePreview(state.Request)) {
+                return;
+            }
+
             if (!m_remoteActivated) {
                 m_activate?.Invoke(m_preview, null);
                 m_remoteActivated = true;
+
+                // Activate may reset presentation state on some game versions, so
+                // re-apply the bridge connection type before the first Show call.
+                if (string.Equals(state.Family, PathPreviewDiscovery.BridgeFamily, StringComparison.Ordinal)
+                    && !PrepareBridgePreview(state.Request)) {
+                    return;
+                }
+
                 m_log?.Invoke("REMOTE PATH GHOST renderer active family=" + state.Family);
             }
 
@@ -110,6 +136,157 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
         catch (Exception ex) {
             LogFailure(ex.GetType().Name + ": " + ex.Message);
         }
+    }
+
+    private bool PrepareBridgePreview(object request) {
+        if (m_preview == null || request == null) return false;
+
+        var bridgeProtoType = FindLoadedType(BridgeProtoTypeName);
+        if (bridgeProtoType == null) {
+            LogBridgeContextWait("BridgeProto type is not loaded");
+            return false;
+        }
+
+        if (m_bridgeStartProto == null || !bridgeProtoType.IsInstanceOfType(m_bridgeStartProto)) {
+            object bridgeProto;
+            if (!TryFindBridgeProtoFromRequest(request, bridgeProtoType, out bridgeProto)
+                && !TryGetBridgeProtoFromController(bridgeProtoType, out bridgeProto)) {
+
+                LogBridgeContextWait("BridgeProto could not be resolved from PreviewRequest/controller");
+                return false;
+            }
+            m_bridgeStartProto = bridgeProto;
+        }
+
+        if (m_setStartConnectionType == null) {
+            m_setStartConnectionType = FindOneArgMethod(
+                m_preview.GetType(),
+                "SetStartConnectionType",
+                bridgeProtoType);
+            if (m_setStartConnectionType == null) {
+                throw new MissingMethodException(
+                    m_preview.GetType().FullName,
+                    "SetStartConnectionType(" + bridgeProtoType.FullName + ")");
+            }
+        }
+
+        m_setStartConnectionType.Invoke(m_preview, new[] { m_bridgeStartProto });
+        if (m_bridgeContextWaitLogged) {
+            m_log?.Invoke("REMOTE PATH GHOST bridge connection type resolved");
+        }
+        m_bridgeContextWaitLogged = false;
+        return true;
+    }
+
+    private bool TryFindBridgeProtoFromRequest(object request, Type bridgeProtoType, out object bridgeProto) {
+        bridgeProto = null;
+
+        object value;
+        if (TryReadMember(request, "BridgeProto", out value)
+            && value != null
+            && bridgeProtoType.IsInstanceOfType(value)) {
+            bridgeProto = value;
+            return true;
+        }
+
+        // Start requests carry the exact segment prototypes selected by the local
+        // player. Search those first, then the current/existing BridgePlan. The
+        // search is intentionally shallow and capped so this remains render-safe.
+        if (TryReadMember(request, "ProtosToPlace", out value)
+            && TryFindValueOfType(value, bridgeProtoType, 2, out bridgeProto)) {
+            return true;
+        }
+        if (TryReadMember(request, "BridgePlan", out value)
+            && TryFindValueOfType(value, bridgeProtoType, 2, out bridgeProto)) {
+            return true;
+        }
+        if (TryReadMember(request, "ExistingTrajectory", out value)
+            && TryFindValueOfType(value, bridgeProtoType, 2, out bridgeProto)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryGetBridgeProtoFromController(Type bridgeProtoType, out object bridgeProto) {
+        bridgeProto = null;
+        var controllerType = FindLoadedType(ControllerTypeName(PathPreviewDiscovery.BridgeFamily));
+        if (controllerType == null) return false;
+
+        object controller = null;
+        try {
+            var resolved = m_resolver.GetResolvedInstance(controllerType);
+            if (resolved.HasValue) controller = resolved.Value;
+        }
+        catch { }
+        if (controller == null) return false;
+
+        object value;
+        if (!TryReadMember(controller, "m_bridgeProto", out value)
+            || value == null
+            || !bridgeProtoType.IsInstanceOfType(value)) {
+            return false;
+        }
+
+        bridgeProto = value;
+        return true;
+    }
+
+    private static bool TryFindValueOfType(object root, Type targetType, int depth, out object found) {
+        found = null;
+        if (root == null || targetType == null) return false;
+        if (targetType.IsInstanceOfType(root)) {
+            found = root;
+            return true;
+        }
+        if (depth <= 0) return false;
+
+        var rootType = root.GetType();
+        if (rootType.IsPrimitive || rootType.IsEnum || root is string || root is Delegate) {
+            return false;
+        }
+
+        var enumerable = root as IEnumerable;
+        if (enumerable != null) {
+            var inspected = 0;
+            foreach (var item in enumerable) {
+                if (++inspected > 16) break;
+                if (TryFindValueOfType(item, targetType, depth - 1, out found)) return true;
+            }
+        }
+
+        var memberCount = 0;
+        for (var type = rootType; type != null && type != typeof(object); type = type.BaseType) {
+            FieldInfo[] fields;
+            try {
+                fields = type.GetFields(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            }
+            catch {
+                continue;
+            }
+
+            for (var i = 0; i < fields.Length; i++) {
+                if (fields[i].IsStatic || ++memberCount > 64) break;
+                object value;
+                try { value = fields[i].GetValue(root); }
+                catch { continue; }
+                if (value == null) continue;
+                if (targetType.IsInstanceOfType(value)) {
+                    found = value;
+                    return true;
+                }
+                if (depth > 1
+                    && (fields[i].Name.IndexOf("proto", StringComparison.OrdinalIgnoreCase) >= 0
+                        || fields[i].Name.IndexOf("bridge", StringComparison.OrdinalIgnoreCase) >= 0)
+                    && TryFindValueOfType(value, targetType, depth - 1, out found)) {
+                    return true;
+                }
+            }
+            if (memberCount > 64) break;
+        }
+
+        return false;
     }
 
     private bool EnsurePreview(string family) {
@@ -143,8 +320,11 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
         m_activate = FindZeroArgMethod(previewType, "Activate");
         m_clear = FindZeroArgMethod(previewType, "Clear");
         m_deactivate = FindZeroArgMethod(previewType, "Deactivate");
+        m_setStartConnectionType = null;
+        m_bridgeStartProto = null;
         m_remoteActivated = false;
         m_waitLogged = false;
+        m_bridgeContextWaitLogged = false;
         m_log?.Invoke("REMOTE PATH GHOST ready family=" + family + " via " + previewType.FullName);
         return true;
     }
@@ -194,8 +374,11 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
         m_activate = null;
         m_clear = null;
         m_deactivate = null;
+        m_setStartConnectionType = null;
+        m_bridgeStartProto = null;
         m_currentFamily = null;
         m_remoteActivated = false;
+        m_bridgeContextWaitLogged = false;
     }
 
     private static MethodInfo FindShowMethod(Type type, string methodName, Type requestType) {
@@ -205,6 +388,17 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
             if (parameters.Length < 2) continue;
             if (parameters[0].ParameterType != requestType) continue;
             if (parameters[1].ParameterType != typeof(ThicknessTilesI)) continue;
+            return method;
+        }
+        return null;
+    }
+
+    private static MethodInfo FindOneArgMethod(Type type, string name, Type argumentType) {
+        foreach (var method in type.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
+            if (!string.Equals(method.Name, name, StringComparison.Ordinal)) continue;
+            var parameters = method.GetParameters();
+            if (parameters.Length != 1) continue;
+            if (parameters[0].ParameterType != argumentType) continue;
             return method;
         }
         return null;
@@ -247,6 +441,12 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
         if (m_waitLogged) return;
         m_waitLogged = true;
         m_log?.Invoke("REMOTE PATH GHOST WAITING - " + message);
+    }
+
+    private void LogBridgeContextWait(string message) {
+        if (m_bridgeContextWaitLogged) return;
+        m_bridgeContextWaitLogged = true;
+        m_log?.Invoke("REMOTE PATH GHOST BRIDGE WAITING - " + message);
     }
 
     private void LogFailure(string message) {
