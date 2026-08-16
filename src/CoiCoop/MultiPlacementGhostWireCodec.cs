@@ -5,9 +5,10 @@ using System.IO;
 namespace CoiCoop;
 
 /// <summary>
-/// Latest-wins payload for ordinary StaticEntityMassPlacer previews that contain
-/// more than one entity (drag rows, duplicated buildings, blueprints, barriers).
-/// Each item reuses the proven Proto + TileTransform placement ghost codec.
+/// Latest-wins payload for composite StaticEntityMassPlacer previews (drag rows,
+/// duplicated buildings, blueprints, barriers). A composite placer may temporarily
+/// expose only one live preview, so one piece is valid even though ordinary single
+/// placement continues to use PlacementGhostWireCodec directly.
 /// </summary>
 internal static class MultiPlacementGhostWireCodec {
     private const byte Version = 1;
@@ -41,12 +42,12 @@ internal static class MultiPlacementGhostWireCodec {
 
         payload = null;
         error = null;
-        if (state == null || state.Pieces == null || state.Pieces.Count < 2) {
-            error = "multi-placement preview needs at least two pieces";
+        if (state == null || state.Pieces == null || state.Pieces.Count < 1) {
+            error = "composite placement preview needs at least one piece";
             return false;
         }
         if (state.Pieces.Count > MaxPieces) {
-            error = "multi-placement preview has too many pieces: " + state.Pieces.Count;
+            error = "composite placement preview has too many pieces: " + state.Pieces.Count;
             return false;
         }
         if (codec == null) {
@@ -63,7 +64,7 @@ internal static class MultiPlacementGhostWireCodec {
                 for (var i = 0; i < state.Pieces.Count; i++) {
                     var piece = state.Pieces[i];
                     if (piece == null || piece.Prototype == null) {
-                        error = "multi-placement piece " + i + " is null";
+                        error = "composite placement piece " + i + " is null";
                         return false;
                     }
 
@@ -76,13 +77,13 @@ internal static class MultiPlacementGhostWireCodec {
                             out piecePayload,
                             out pieceError)) {
 
-                        error = "multi-placement piece " + i + " encode failed: " + pieceError;
+                        error = "composite placement piece " + i + " encode failed: " + pieceError;
                         return false;
                     }
                     if (piecePayload == null
                         || piecePayload.Length == 0
                         || piecePayload.Length > MaxPiecePayloadBytes) {
-                        error = "multi-placement piece " + i + " payload size is invalid";
+                        error = "composite placement piece " + i + " payload size is invalid";
                         return false;
                     }
 
@@ -92,7 +93,7 @@ internal static class MultiPlacementGhostWireCodec {
 
                 writer.Flush();
                 if (stream.Length > MaxTotalPayloadBytes) {
-                    error = "multi-placement payload is unexpectedly large: " + stream.Length;
+                    error = "composite placement payload is unexpectedly large: " + stream.Length;
                     return false;
                 }
                 payload = stream.ToArray();
@@ -114,11 +115,11 @@ internal static class MultiPlacementGhostWireCodec {
         state = null;
         error = null;
         if (payload == null || payload.Length == 0) {
-            error = "multi-placement payload is empty";
+            error = "composite placement payload is empty";
             return false;
         }
         if (payload.Length > MaxTotalPayloadBytes) {
-            error = "multi-placement payload is too large: " + payload.Length;
+            error = "composite placement payload is too large: " + payload.Length;
             return false;
         }
         if (codec == null) {
@@ -131,13 +132,13 @@ internal static class MultiPlacementGhostWireCodec {
             using (var reader = new BinaryReader(stream)) {
                 var version = reader.ReadByte();
                 if (version != Version) {
-                    error = "unsupported multi-placement payload version " + version;
+                    error = "unsupported composite placement payload version " + version;
                     return false;
                 }
 
                 var pieceCount = reader.ReadInt32();
-                if (pieceCount < 2 || pieceCount > MaxPieces) {
-                    error = "invalid multi-placement piece count " + pieceCount;
+                if (pieceCount < 1 || pieceCount > MaxPieces) {
+                    error = "invalid composite placement piece count " + pieceCount;
                     return false;
                 }
 
@@ -147,7 +148,7 @@ internal static class MultiPlacementGhostWireCodec {
                     if (length <= 0
                         || length > MaxPiecePayloadBytes
                         || length > stream.Length - stream.Position) {
-                        error = "invalid multi-placement piece payload length " + length + " at index " + i;
+                        error = "invalid composite placement piece payload length " + length + " at index " + i;
                         return false;
                     }
 
@@ -160,14 +161,14 @@ internal static class MultiPlacementGhostWireCodec {
                             out decoded,
                             out pieceError)) {
 
-                        error = "multi-placement piece " + i + " decode failed: " + pieceError;
+                        error = "composite placement piece " + i + " decode failed: " + pieceError;
                         return false;
                     }
                     pieces.Add(new Piece(decoded.Prototype, decoded.Transform));
                 }
 
                 if (stream.Position != stream.Length) {
-                    error = "multi-placement payload has trailing bytes";
+                    error = "composite placement payload has trailing bytes";
                     return false;
                 }
 
@@ -176,7 +177,7 @@ internal static class MultiPlacementGhostWireCodec {
             }
         }
         catch (EndOfStreamException) {
-            error = "multi-placement payload ended unexpectedly";
+            error = "composite placement payload ended unexpectedly";
             return false;
         }
         catch (Exception ex) {
