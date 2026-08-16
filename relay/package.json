@@ -5,7 +5,8 @@
   "description": "Rendezvous and WebSocket byte relay for the COI-Coop development transport.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:smoke": "node smoke-test.js"
   },
   "engines": {
     "node": ">=20"
