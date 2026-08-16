@@ -46,26 +46,36 @@ if ($clientMatches.Count -gt 1) {
 }
 $clientSave = $clientMatches[0]
 
+$relativeSaveDirectory = $clientSave.DirectoryName.Substring($saveRoot.Length).TrimStart('\')
+$relativeSavePath = if ([string]::IsNullOrWhiteSpace($relativeSaveDirectory)) {
+    $clientSave.Name
+}
+else {
+    Join-Path $relativeSaveDirectory $clientSave.Name
+}
+
 New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 if (Test-Path $stageRoot) { Remove-Item $stageRoot -Recurse -Force }
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
 $stageScripts = Join-Path $stageRoot "scripts"
 $stageMod = Join-Path $stageRoot "payload\CoiCoop"
-$stageSave = Join-Path $stageRoot "payload\Save"
+$stageSavesRoot = Join-Path $stageRoot "payload\Saves"
+$stageSavePath = Join-Path $stageSavesRoot $relativeSavePath
+$stageSaveDirectory = Split-Path -Parent $stageSavePath
 New-Item -ItemType Directory -Path $stageScripts -Force | Out-Null
 New-Item -ItemType Directory -Path $stageMod -Force | Out-Null
-New-Item -ItemType Directory -Path $stageSave -Force | Out-Null
+New-Item -ItemType Directory -Path $stageSaveDirectory -Force | Out-Null
 
 Copy-Item (Join-Path $PSScriptRoot "launch-coop.ps1") $stageScripts -Force
 Copy-Item (Join-Path $PSScriptRoot "launch-lan-client.bat") $stageScripts -Force
 foreach ($name in $requiredModFiles) {
     Copy-Item (Join-Path $modRoot $name) (Join-Path $stageMod $name) -Force
 }
-Copy-Item $clientSave.FullName (Join-Path $stageSave $clientSave.Name) -Force
+Copy-Item $clientSave.FullName $stageSavePath -Force
 
 $dllHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $stageMod "CoiCoop.dll")).Hash
-$saveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $stageSave $clientSave.Name)).Hash
+$saveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stageSavePath).Hash
 
 $installer = @'
 @echo off
@@ -85,13 +95,10 @@ copy /Y "payload\CoiCoop\CoiCoop.dll" "%MODDST%\CoiCoop.dll" >nul || goto :fail
 copy /Y "payload\CoiCoop\manifest.json" "%MODDST%\manifest.json" >nul || goto :fail
 copy /Y "payload\CoiCoop\config.json" "%MODDST%\config.json" >nul || goto :fail
 
-for %%F in ("payload\Save\*.save") do (
-    set "SAVEFILE=%%~nxF"
-    copy /Y "%%~fF" "%SAVEROOT%\%%~nxF" >nul || goto :fail
-)
+xcopy "payload\Saves\*" "%SAVEROOT%\" /E /I /Y >nul || goto :fail
 
 echo Mod installed to: %MODDST%
-echo Save installed to: %SAVEROOT%\%SAVEFILE%
+echo Save payload copied under: %SAVEROOT%
 echo.
 echo Captain of Industry will now start as the LAN CLIENT.
 echo Enter the host LAN IPv4 when requested.
@@ -120,6 +127,9 @@ COI-Coop two-PC LAN client test kit
 Both PCs must use the same Captain of Industry version.
 This kit is for a trusted private LAN test only; do not expose the development tunnel ports to the public internet.
 
+Installed save relative path:
+$relativeSavePath
+
 CoiCoop.dll SHA256:
 $dllHash
 
@@ -131,6 +141,7 @@ Set-Content -LiteralPath (Join-Path $stageRoot "README.txt") -Value $readme -Enc
 $manifest = @"
 COI-Coop LAN friend kit
 Created: $(Get-Date -Format o)
+Save relative path=$relativeSavePath
 CoiCoop.dll SHA256=$dllHash
 $($clientSave.Name) SHA256=$saveHash
 "@
@@ -142,6 +153,7 @@ Write-Host ""
 Write-Host "LAN FRIEND KIT READY" -ForegroundColor Green
 Write-Host "ZIP:  $zipPath"
 Write-Host "Save: $($clientSave.FullName)"
+Write-Host "Save relative path: $relativeSavePath"
 Write-Host "Save SHA256: $saveHash"
 Write-Host "Mod  SHA256: $dllHash"
 Write-Host ""
