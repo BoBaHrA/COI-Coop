@@ -22,6 +22,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private const int PlacementSampleIntervalMs = 33;
     private const int SandboxSampleIntervalMs = 100;
     private const string PlacementKind = "PLACEMENT_GHOST";
+    private const string MultiPlacementKind = "PLACEMENT_MULTI_GHOST";
     private const string SandboxKind = "SANDBOX_SOURCE";
 
     private static readonly object s_lock = new object();
@@ -36,6 +37,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private CommandRoundTripProbe m_previewCodec;
     private PlacementPreviewSession m_session;
     private RemotePlacementGhostRenderer m_remoteGhostRenderer;
+    private RemoteMultiPlacementGhostRenderer m_remoteMultiGhostRenderer;
     private ISimLoopEvents m_simLoop;
     private IGameLoopEvents m_gameLoop;
     private int m_lastPlacementSampleMs;
@@ -49,8 +51,12 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private bool m_localGhostVisible;
     private bool m_localGhostFailureLogged;
     private bool m_peerGhostVisible;
+    private string m_localGhostKind;
+    private string m_peerGhostKind;
     private string m_lastLocalGhostProtoKey;
     private string m_lastPeerGhostProtoKey;
+    private int m_lastLocalMultiCount = -1;
+    private int m_lastPeerMultiCount = -1;
 
     private PlacementPreviewBootstrap(DependencyResolver resolver, int mode, int previewPort) {
         m_resolver = resolver;
@@ -81,6 +87,9 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_stateCodec = new CommandRoundTripProbe(m_resolver);
         m_previewCodec = new CommandRoundTripProbe(m_resolver);
         m_remoteGhostRenderer = new RemotePlacementGhostRenderer(
+            m_resolver,
+            message => Log.Info("COI-Coop: " + message));
+        m_remoteMultiGhostRenderer = new RemoteMultiPlacementGhostRenderer(
             m_resolver,
             message => Log.Info("COI-Coop: " + message));
         m_session = new PlacementPreviewSession(
@@ -147,12 +156,11 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             SamplePlacementPreview();
         }
         else if (m_peerGhostVisible) {
-            m_peerGhostVisible = false;
-            m_lastPeerGhostProtoKey = null;
-            m_remoteGhostRenderer?.Clear();
+            ClearPeerGhosts();
         }
 
         m_remoteGhostRenderer?.RenderUpdate();
+        m_remoteMultiGhostRenderer?.RenderUpdate();
     }
 
     private void OnUpdateEndForUi() {
@@ -178,6 +186,40 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         if (unchecked(now - m_lastPlacementSampleMs) < PlacementSampleIntervalMs) return;
         m_lastPlacementSampleMs = now;
 
+        PlacementPreviewDiscovery.CapturedSet capturedSet;
+        string setCaptureError;
+        if (m_discovery.TryCaptureBuildingGhostSet(out capturedSet, out setCaptureError)) {
+            byte[] setPayload;
+            string setEncodeError;
+            if (!MultiPlacementGhostWireCodec.TryEncode(
+                    capturedSet,
+                    m_previewCodec,
+                    out setPayload,
+                    out setEncodeError)) {
+
+                if (!m_localGhostFailureLogged) {
+                    m_localGhostFailureLogged = true;
+                    Log.Info("COI-Coop: PREVIEW MULTI GHOST ENCODE FAIL - " + setEncodeError);
+                }
+                return;
+            }
+
+            m_localGhostFailureLogged = false;
+            var revision = m_session.Publish(MultiPlacementKind, setPayload);
+            m_localGhostVisible = true;
+            m_localGhostKind = MultiPlacementKind;
+            m_lastLocalGhostProtoKey = null;
+
+            if (m_lastLocalMultiCount != capturedSet.Pieces.Count) {
+                m_lastLocalMultiCount = capturedSet.Pieces.Count;
+                Log.Info(
+                    "COI-Coop: PREVIEW MULTI GHOST TX START rev=" + revision
+                    + " pieces=" + capturedSet.Pieces.Count
+                    + " bytes=" + setPayload.Length);
+            }
+            return;
+        }
+
         Proto prototype;
         TileTransform transform;
         string captureError;
@@ -185,15 +227,21 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             if (m_localGhostVisible) {
                 m_session.Clear();
                 m_localGhostVisible = false;
+                m_localGhostKind = null;
                 m_lastLocalGhostProtoKey = null;
+                m_lastLocalMultiCount = -1;
                 Log.Info("COI-Coop: PREVIEW GHOST TX CLEAR");
             }
 
-            // No active placer is the normal steady state, not an error.
+            // No active placer is the normal steady state, not an error. Likewise,
+            // a multi-placement probe seeing fewer than two pieces simply means the
+            // normal single-object path should be used.
             if (!string.Equals(captureError, "no active StaticEntityMassPlacer", StringComparison.Ordinal)
                 && !m_localGhostFailureLogged) {
                 m_localGhostFailureLogged = true;
-                Log.Info("COI-Coop: PREVIEW GHOST CAPTURE WAIT - " + captureError);
+                Log.Info(
+                    "COI-Coop: PREVIEW GHOST CAPTURE WAIT - " + captureError
+                    + "; multi=" + (setCaptureError ?? "<null>"));
             }
             return;
         }
@@ -216,14 +264,17 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             return;
         }
 
-        var revision = m_session.Publish(PlacementKind, payload);
+        var singleRevision = m_session.Publish(PlacementKind, payload);
         m_localGhostVisible = true;
+        var switchedFromMulti = !string.Equals(m_localGhostKind, PlacementKind, StringComparison.Ordinal);
+        m_localGhostKind = PlacementKind;
+        m_lastLocalMultiCount = -1;
 
         var protoKey = GetProtoKey(prototype);
-        if (!string.Equals(protoKey, m_lastLocalGhostProtoKey, StringComparison.Ordinal)) {
+        if (switchedFromMulti || !string.Equals(protoKey, m_lastLocalGhostProtoKey, StringComparison.Ordinal)) {
             m_lastLocalGhostProtoKey = protoKey;
             Log.Info(
-                "COI-Coop: PREVIEW GHOST TX START rev=" + revision
+                "COI-Coop: PREVIEW GHOST TX START rev=" + singleRevision
                 + " proto=" + protoKey
                 + " bytes=" + payload.Length
                 + " transform=" + transform);
@@ -308,10 +359,42 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
 
             if (string.Equals(peer.Kind, "NONE", StringComparison.Ordinal)) {
                 if (m_peerGhostVisible) {
-                    m_peerGhostVisible = false;
-                    m_lastPeerGhostProtoKey = null;
-                    m_remoteGhostRenderer?.Clear();
+                    ClearPeerGhosts();
                     Log.Info("COI-Coop: PREVIEW GHOST RX CLEAR rev=" + peer.Revision);
+                }
+                continue;
+            }
+
+            if (string.Equals(peer.Kind, MultiPlacementKind, StringComparison.Ordinal)) {
+                MultiPlacementGhostWireCodec.DecodedState decodedSet;
+                string setDecodeError = "preview codec unavailable";
+                if (m_previewCodec == null
+                    || !MultiPlacementGhostWireCodec.TryDecode(
+                        peer.Payload,
+                        m_previewCodec,
+                        out decodedSet,
+                        out setDecodeError)) {
+
+                    Log.Info(
+                        "COI-Coop: PREVIEW MULTI GHOST RX FAIL rev=" + peer.Revision
+                        + " error=" + setDecodeError);
+                    continue;
+                }
+
+                if (!string.Equals(m_peerGhostKind, MultiPlacementKind, StringComparison.Ordinal)) {
+                    m_remoteGhostRenderer?.Clear();
+                }
+                m_peerGhostVisible = true;
+                m_peerGhostKind = MultiPlacementKind;
+                m_lastPeerGhostProtoKey = null;
+                m_remoteMultiGhostRenderer?.Publish(decodedSet);
+
+                if (m_lastPeerMultiCount != decodedSet.Pieces.Count) {
+                    m_lastPeerMultiCount = decodedSet.Pieces.Count;
+                    Log.Info(
+                        "COI-Coop: PREVIEW MULTI GHOST RX START rev=" + peer.Revision
+                        + " pieces=" + decodedSet.Pieces.Count
+                        + " bytes=" + (peer.Payload?.Length ?? 0));
                 }
                 continue;
             }
@@ -331,7 +414,12 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
                 continue;
             }
 
+            if (!string.Equals(m_peerGhostKind, PlacementKind, StringComparison.Ordinal)) {
+                m_remoteMultiGhostRenderer?.Clear();
+            }
             m_peerGhostVisible = true;
+            m_peerGhostKind = PlacementKind;
+            m_lastPeerMultiCount = -1;
             m_remoteGhostRenderer?.Publish(decoded.Prototype, decoded.Transform);
 
             var protoKey = GetProtoKey(decoded.Prototype);
@@ -344,6 +432,15 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
                     + " transform=" + decoded.Transform);
             }
         }
+    }
+
+    private void ClearPeerGhosts() {
+        m_peerGhostVisible = false;
+        m_peerGhostKind = null;
+        m_lastPeerGhostProtoKey = null;
+        m_lastPeerMultiCount = -1;
+        m_remoteGhostRenderer?.Clear();
+        m_remoteMultiGhostRenderer?.Clear();
     }
 
     private static byte[] BuildSandboxWirePayload(int entityId, byte[] valuePayload) {
@@ -403,6 +500,9 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_remoteGhostRenderer?.Clear();
         m_remoteGhostRenderer?.Dispose();
         m_remoteGhostRenderer = null;
+        m_remoteMultiGhostRenderer?.Clear();
+        m_remoteMultiGhostRenderer?.Dispose();
+        m_remoteMultiGhostRenderer = null;
         m_session?.Dispose();
         m_session = null;
         m_discovery = null;
