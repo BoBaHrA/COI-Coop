@@ -7,14 +7,16 @@ using Mafi.Core.GameLoop;
 namespace CoiCoop;
 
 /// <summary>
-/// Independent latest-wins sidecar for multi-stage transport/bridge/train ghosts.
-/// Kept on mainPort+2 during development so failures here cannot regress the
-/// already-working building-ghost/sandbox channel on mainPort+1.
+/// Independent latest-wins sidecar for multi-stage transport/bridge/train ghosts
+/// plus modular vehicle ramp previews. Kept on mainPort+2 during development so
+/// failures here cannot regress the already-working building-ghost/sandbox channel
+/// on mainPort+1.
 /// </summary>
 internal sealed class PathPreviewBootstrap : IDisposable {
     private const int SampleIntervalMs = 33;
     private const int ClearGraceMs = 150;
     private const string PathKind = "PATH_GHOST";
+    private const string RampKind = "RAMP_GHOST";
 
     private static readonly object s_lock = new object();
     private static PathPreviewBootstrap s_current;
@@ -24,9 +26,11 @@ internal sealed class PathPreviewBootstrap : IDisposable {
     private readonly int m_port;
 
     private PathPreviewDiscovery m_discovery;
+    private RampPreviewDiscovery m_rampDiscovery;
     private CommandRoundTripProbe m_codec;
     private PlacementPreviewSession m_session;
     private RemotePathGhostRenderer m_renderer;
+    private RemoteRampGhostRenderer m_rampRenderer;
     private IGameLoopEvents m_gameLoop;
     private bool m_renderHooked;
     private bool m_resolverObserved;
@@ -37,6 +41,9 @@ internal sealed class PathPreviewBootstrap : IDisposable {
     private bool m_captureFailureLogged;
     private bool m_encodeFailureLogged;
     private int m_lastCandidateCount = -1;
+    private int m_lastRampCandidateCount = -1;
+    private string m_localKind;
+    private string m_peerKind;
     private string m_lastLocalLabel;
     private string m_lastPeerLabel;
 
@@ -65,8 +72,12 @@ internal sealed class PathPreviewBootstrap : IDisposable {
 
     private void Start() {
         m_discovery = new PathPreviewDiscovery(m_resolver);
+        m_rampDiscovery = new RampPreviewDiscovery(m_resolver);
         m_codec = new CommandRoundTripProbe(m_resolver);
         m_renderer = new RemotePathGhostRenderer(
+            m_resolver,
+            message => Log.Info("COI-Coop: " + message));
+        m_rampRenderer = new RemoteRampGhostRenderer(
             m_resolver,
             message => Log.Info("COI-Coop: " + message));
         m_session = new PlacementPreviewSession(
@@ -97,6 +108,9 @@ internal sealed class PathPreviewBootstrap : IDisposable {
         if (m_discovery != null && m_discovery.ObserveInstance(instance)) {
             Log.Info("COI-Coop: PATH targeted controller " + instance.GetType().FullName);
         }
+        if (m_rampDiscovery != null && m_rampDiscovery.ObserveInstance(instance)) {
+            Log.Info("COI-Coop: RAMP targeted controller " + instance.GetType().FullName);
+        }
     }
 
     private void AttachGameLoop(IGameLoopEvents gameLoop) {
@@ -115,19 +129,16 @@ internal sealed class PathPreviewBootstrap : IDisposable {
         if (m_session.IsConnected) {
             SampleLocal();
         }
-        else {
-            if (m_peerVisible) {
-                m_peerVisible = false;
-                m_lastPeerLabel = null;
-                m_renderer?.Clear();
-            }
+        else if (m_peerVisible) {
+            ClearPeerRenderers();
         }
 
         m_renderer?.RenderUpdate();
+        m_rampRenderer?.RenderUpdate();
     }
 
     private void SampleLocal() {
-        if (m_discovery == null || m_codec == null) return;
+        if (m_discovery == null || m_rampDiscovery == null || m_codec == null) return;
 
         var changed = m_discovery.RefreshResolvedCandidates();
         if (changed || m_lastCandidateCount != m_discovery.CandidateCount) {
@@ -135,34 +146,57 @@ internal sealed class PathPreviewBootstrap : IDisposable {
             Log.Info("COI-Coop: PATH targeted controllers=" + m_lastCandidateCount);
         }
 
+        var rampChanged = m_rampDiscovery.RefreshResolvedCandidate();
+        var rampCandidateCount = m_rampDiscovery.HasCandidate ? 1 : 0;
+        if (rampChanged || m_lastRampCandidateCount != rampCandidateCount) {
+            m_lastRampCandidateCount = rampCandidateCount;
+            Log.Info("COI-Coop: RAMP targeted controllers=" + m_lastRampCandidateCount);
+        }
+
         var now = Environment.TickCount;
         if (unchecked(now - m_lastSampleMs) < SampleIntervalMs) return;
         m_lastSampleMs = now;
 
-        PathPreviewDiscovery.CapturedState captured;
-        string captureError;
-        if (!m_discovery.TryCapture(out captured, out captureError)) {
-            if (m_localVisible) {
-                if (m_noCaptureSinceMs == 0) m_noCaptureSinceMs = now;
-                if (unchecked(now - m_noCaptureSinceMs) >= ClearGraceMs) {
-                    m_session.Clear();
-                    m_localVisible = false;
-                    m_lastLocalLabel = null;
-                    m_noCaptureSinceMs = 0;
-                    Log.Info("COI-Coop: PATH GHOST TX CLEAR");
-                }
-            }
-
-            if (!string.Equals(captureError, "no active multi-stage path controller", StringComparison.Ordinal)
-                && captureError != null
-                && captureError.IndexOf("no current PreviewRequest", StringComparison.Ordinal) < 0
-                && !m_captureFailureLogged) {
-                m_captureFailureLogged = true;
-                Log.Info("COI-Coop: PATH GHOST CAPTURE WAIT - " + captureError);
-            }
+        PathPreviewDiscovery.CapturedState pathCaptured;
+        string pathCaptureError;
+        if (m_discovery.TryCapture(out pathCaptured, out pathCaptureError)) {
+            PublishPath(pathCaptured);
             return;
         }
 
+        RampPreviewDiscovery.CapturedState rampCaptured;
+        string rampCaptureError;
+        if (m_rampDiscovery.TryCapture(out rampCaptured, out rampCaptureError)) {
+            PublishRamp(rampCaptured);
+            return;
+        }
+
+        if (m_localVisible) {
+            if (m_noCaptureSinceMs == 0) m_noCaptureSinceMs = now;
+            if (unchecked(now - m_noCaptureSinceMs) >= ClearGraceMs) {
+                m_session.Clear();
+                m_localVisible = false;
+                m_localKind = null;
+                m_lastLocalLabel = null;
+                m_noCaptureSinceMs = 0;
+                Log.Info("COI-Coop: PATH/RAMP GHOST TX CLEAR");
+            }
+        }
+
+        if (!m_captureFailureLogged) {
+            var pathAbnormal = !IsNormalPathCaptureMiss(pathCaptureError);
+            var rampAbnormal = !IsNormalRampCaptureMiss(rampCaptureError);
+            if (pathAbnormal || rampAbnormal) {
+                m_captureFailureLogged = true;
+                Log.Info(
+                    "COI-Coop: PATH/RAMP GHOST CAPTURE WAIT - path="
+                    + (pathCaptureError ?? "<null>")
+                    + "; ramp=" + (rampCaptureError ?? "<null>"));
+            }
+        }
+    }
+
+    private void PublishPath(PathPreviewDiscovery.CapturedState captured) {
         m_noCaptureSinceMs = 0;
         m_captureFailureLogged = false;
 
@@ -179,8 +213,10 @@ internal sealed class PathPreviewBootstrap : IDisposable {
 
         var revision = m_session.Publish(PathKind, payload);
         m_localVisible = true;
+        m_localKind = PathKind;
 
-        var label = captured.Family + "/" + (captured.IsContinuation ? "CONT" : "START")
+        var label = PathKind + "/" + captured.Family + "/"
+            + (captured.IsContinuation ? "CONT" : "START")
             + "/" + captured.ControllerState;
         if (!string.Equals(label, m_lastLocalLabel, StringComparison.Ordinal)) {
             m_lastLocalLabel = label;
@@ -193,6 +229,36 @@ internal sealed class PathPreviewBootstrap : IDisposable {
         }
     }
 
+    private void PublishRamp(RampPreviewDiscovery.CapturedState captured) {
+        m_noCaptureSinceMs = 0;
+        m_captureFailureLogged = false;
+
+        byte[] payload;
+        string encodeError;
+        if (!RampGhostWireCodec.TryEncode(captured, m_codec, out payload, out encodeError)) {
+            if (!m_encodeFailureLogged) {
+                m_encodeFailureLogged = true;
+                Log.Info("COI-Coop: RAMP GHOST ENCODE FAIL - " + encodeError);
+            }
+            return;
+        }
+        m_encodeFailureLogged = false;
+
+        var revision = m_session.Publish(RampKind, payload);
+        m_localVisible = true;
+        m_localKind = RampKind;
+
+        var label = RampKind + "/" + captured.ControllerState + "/pieces=" + captured.Pieces.Count;
+        if (!string.Equals(label, m_lastLocalLabel, StringComparison.Ordinal)) {
+            m_lastLocalLabel = label;
+            Log.Info(
+                "COI-Coop: RAMP GHOST TX START rev=" + revision
+                + " state=" + captured.ControllerState
+                + " pieces=" + captured.Pieces.Count
+                + " bytes=" + payload.Length);
+        }
+    }
+
     private void PumpIncoming() {
         PlacementPreviewState peer;
         while (m_session.TryTakeLatestPeerState(out peer)) {
@@ -200,40 +266,90 @@ internal sealed class PathPreviewBootstrap : IDisposable {
 
             if (string.Equals(peer.Kind, "NONE", StringComparison.Ordinal)) {
                 if (m_peerVisible) {
-                    m_peerVisible = false;
-                    m_lastPeerLabel = null;
-                    m_renderer?.Clear();
-                    Log.Info("COI-Coop: PATH GHOST RX CLEAR rev=" + peer.Revision);
+                    ClearPeerRenderers();
+                    Log.Info("COI-Coop: PATH/RAMP GHOST RX CLEAR rev=" + peer.Revision);
                 }
                 continue;
             }
 
-            if (!string.Equals(peer.Kind, PathKind, StringComparison.Ordinal)) continue;
+            if (string.Equals(peer.Kind, PathKind, StringComparison.Ordinal)) {
+                PathPreviewWireCodec.DecodedState decoded;
+                string decodeError;
+                if (!PathPreviewWireCodec.TryDecode(peer.Payload, m_codec, out decoded, out decodeError)) {
+                    Log.Info(
+                        "COI-Coop: PATH GHOST RX FAIL rev=" + peer.Revision
+                        + " error=" + decodeError);
+                    continue;
+                }
 
-            PathPreviewWireCodec.DecodedState decoded;
-            string decodeError;
-            if (!PathPreviewWireCodec.TryDecode(peer.Payload, m_codec, out decoded, out decodeError)) {
-                Log.Info(
-                    "COI-Coop: PATH GHOST RX FAIL rev=" + peer.Revision
-                    + " error=" + decodeError);
+                if (!string.Equals(m_peerKind, PathKind, StringComparison.Ordinal)) {
+                    m_rampRenderer?.Clear();
+                }
+                m_peerVisible = true;
+                m_peerKind = PathKind;
+                m_renderer?.Publish(decoded);
+
+                var label = PathKind + "/" + decoded.Family + "/"
+                    + (decoded.IsContinuation ? "CONT" : "START")
+                    + "/" + decoded.ControllerState;
+                if (!string.Equals(label, m_lastPeerLabel, StringComparison.Ordinal)) {
+                    m_lastPeerLabel = label;
+                    Log.Info(
+                        "COI-Coop: PATH GHOST RX START rev=" + peer.Revision
+                        + " family=" + decoded.Family
+                        + " stage=" + (decoded.IsContinuation ? "CONT" : "START")
+                        + " state=" + decoded.ControllerState
+                        + " bytes=" + (peer.Payload?.Length ?? 0));
+                }
                 continue;
             }
 
-            m_peerVisible = true;
-            m_renderer?.Publish(decoded);
+            if (string.Equals(peer.Kind, RampKind, StringComparison.Ordinal)) {
+                RampGhostWireCodec.DecodedState decoded;
+                string decodeError;
+                if (!RampGhostWireCodec.TryDecode(peer.Payload, m_codec, out decoded, out decodeError)) {
+                    Log.Info(
+                        "COI-Coop: RAMP GHOST RX FAIL rev=" + peer.Revision
+                        + " error=" + decodeError);
+                    continue;
+                }
 
-            var label = decoded.Family + "/" + (decoded.IsContinuation ? "CONT" : "START")
-                + "/" + decoded.ControllerState;
-            if (!string.Equals(label, m_lastPeerLabel, StringComparison.Ordinal)) {
-                m_lastPeerLabel = label;
-                Log.Info(
-                    "COI-Coop: PATH GHOST RX START rev=" + peer.Revision
-                    + " family=" + decoded.Family
-                    + " stage=" + (decoded.IsContinuation ? "CONT" : "START")
-                    + " state=" + decoded.ControllerState
-                    + " bytes=" + (peer.Payload?.Length ?? 0));
+                if (!string.Equals(m_peerKind, RampKind, StringComparison.Ordinal)) {
+                    m_renderer?.Clear();
+                }
+                m_peerVisible = true;
+                m_peerKind = RampKind;
+                m_rampRenderer?.Publish(decoded);
+
+                var label = RampKind + "/" + decoded.ControllerState + "/pieces=" + decoded.Pieces.Count;
+                if (!string.Equals(label, m_lastPeerLabel, StringComparison.Ordinal)) {
+                    m_lastPeerLabel = label;
+                    Log.Info(
+                        "COI-Coop: RAMP GHOST RX START rev=" + peer.Revision
+                        + " state=" + decoded.ControllerState
+                        + " pieces=" + decoded.Pieces.Count
+                        + " bytes=" + (peer.Payload?.Length ?? 0));
+                }
             }
         }
+    }
+
+    private void ClearPeerRenderers() {
+        m_peerVisible = false;
+        m_peerKind = null;
+        m_lastPeerLabel = null;
+        m_renderer?.Clear();
+        m_rampRenderer?.Clear();
+    }
+
+    private static bool IsNormalPathCaptureMiss(string error) {
+        if (string.Equals(error, "no active multi-stage path controller", StringComparison.Ordinal)) return true;
+        return error != null && error.IndexOf("no current PreviewRequest", StringComparison.Ordinal) >= 0;
+    }
+
+    private static bool IsNormalRampCaptureMiss(string error) {
+        return string.Equals(error, "no active modular vehicle ramp controller", StringComparison.Ordinal)
+            || string.Equals(error, "active ramp controller has no preview pieces yet", StringComparison.Ordinal);
     }
 
     private static int ReadEnvironmentInt(string name, int fallback) {
@@ -255,9 +371,13 @@ internal sealed class PathPreviewBootstrap : IDisposable {
         m_renderer?.Clear();
         m_renderer?.Dispose();
         m_renderer = null;
+        m_rampRenderer?.Clear();
+        m_rampRenderer?.Dispose();
+        m_rampRenderer = null;
         m_session?.Dispose();
         m_session = null;
         m_discovery = null;
+        m_rampDiscovery = null;
         m_codec = null;
         m_gameLoop = null;
     }
