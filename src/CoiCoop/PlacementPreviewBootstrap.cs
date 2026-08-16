@@ -13,12 +13,13 @@ namespace CoiCoop;
 /// Auxiliary co-op sidecar for presentation-only building placement ghosts and
 /// targeted sandbox source/sink state adapters.
 ///
-/// Network/state sampling happens from the sim/UI-end hook. Actual ghost creation
-/// and transform updates happen only from IGameLoopEvents.RenderUpdate so Unity
-/// preview objects are never touched from the simulation thread.
+/// Building placement sampling, network RX/TX, and actual ghost rendering run from
+/// IGameLoopEvents.RenderUpdate so peer previews are not limited by the ~10 Hz
+/// simulation/UI-end cadence. Sandbox endpoint synchronization remains on the
+/// simulation-side UpdateEndForUi hook.
 /// </summary>
 internal sealed class PlacementPreviewBootstrap : IDisposable {
-    private const int PlacementSampleIntervalMs = 100;
+    private const int PlacementSampleIntervalMs = 33;
     private const int SandboxSampleIntervalMs = 100;
     private const string PlacementKind = "PLACEMENT_GHOST";
     private const string SandboxKind = "SANDBOX_SOURCE";
@@ -32,6 +33,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private PlacementPreviewDiscovery m_discovery;
     private SandboxSourceDiscovery m_sandboxDiscovery;
     private CommandRoundTripProbe m_stateCodec;
+    private CommandRoundTripProbe m_previewCodec;
     private PlacementPreviewSession m_session;
     private RemotePlacementGhostRenderer m_remoteGhostRenderer;
     private ISimLoopEvents m_simLoop;
@@ -77,6 +79,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_discovery = new PlacementPreviewDiscovery(m_resolver);
         m_sandboxDiscovery = new SandboxSourceDiscovery(m_resolver);
         m_stateCodec = new CommandRoundTripProbe(m_resolver);
+        m_previewCodec = new CommandRoundTripProbe(m_resolver);
         m_remoteGhostRenderer = new RemotePlacementGhostRenderer(
             m_resolver,
             message => Log.Info("COI-Coop: " + message));
@@ -125,7 +128,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_simLoop = simLoop;
         m_simLoop.UpdateEndForUi.AddNonSaveable(this, OnUpdateEndForUi);
         m_simHooked = true;
-        Log.Info("COI-Coop: PREVIEW lightweight UpdateEndForUi sampler attached");
+        Log.Info("COI-Coop: SANDBOX lightweight UpdateEndForUi sampler attached");
     }
 
     private void AttachGameLoop(IGameLoopEvents gameLoop) {
@@ -133,32 +136,35 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_gameLoop = gameLoop;
         m_gameLoop.RenderUpdate.AddNonSaveable(this, OnRenderUpdate);
         m_renderHooked = true;
-        Log.Info("COI-Coop: REMOTE GHOST RenderUpdate hook attached");
+        Log.Info("COI-Coop: PREVIEW 30 Hz RenderUpdate sampler + remote ghost hook attached");
     }
 
     private void OnRenderUpdate(GameTime gameTime) {
-        if (!ReferenceEquals(s_current, this)) return;
+        if (!ReferenceEquals(s_current, this) || m_session == null) return;
+
+        PumpIncomingGhost();
+        if (m_session.IsConnected) {
+            SamplePlacementPreview();
+        }
+        else if (m_peerGhostVisible) {
+            m_peerGhostVisible = false;
+            m_lastPeerGhostProtoKey = null;
+            m_remoteGhostRenderer?.Clear();
+        }
+
         m_remoteGhostRenderer?.RenderUpdate();
     }
 
     private void OnUpdateEndForUi() {
         if (!ReferenceEquals(s_current, this) || m_session == null) return;
 
-        PumpIncoming();
-        if (!m_session.IsConnected) {
-            if (m_peerGhostVisible) {
-                m_peerGhostVisible = false;
-                m_remoteGhostRenderer?.Clear();
-            }
-            return;
-        }
-
-        SamplePlacementPreview();
+        PumpIncomingSandbox();
+        if (!m_session.IsConnected) return;
         SampleSandboxSources();
     }
 
     private void SamplePlacementPreview() {
-        if (m_discovery == null || m_stateCodec == null) return;
+        if (m_discovery == null || m_previewCodec == null) return;
 
         var changedCandidates = m_discovery.RefreshResolvedCandidates();
         if (changedCandidates || m_lastLoggedCandidateCount != m_discovery.CandidateCount) {
@@ -199,7 +205,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         if (!PlacementGhostWireCodec.TryEncode(
                 prototype,
                 transform,
-                m_stateCodec,
+                m_previewCodec,
                 out payload,
                 out encodeError)) {
 
@@ -262,7 +268,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         }
     }
 
-    private void PumpIncoming() {
+    private void PumpIncomingSandbox() {
         PlacementPreviewState reliable;
         while (m_session.TryDequeueReliablePeerState(out reliable)) {
             if (reliable == null || !string.Equals(reliable.Kind, SandboxKind, StringComparison.Ordinal)) {
@@ -293,7 +299,9 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
                 + " entity=" + entityId
                 + " bytes=" + valuePayload.Length);
         }
+    }
 
+    private void PumpIncomingGhost() {
         PlacementPreviewState peer;
         while (m_session.TryTakeLatestPeerState(out peer)) {
             if (peer == null) continue;
@@ -313,9 +321,9 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             }
 
             PlacementGhostWireCodec.DecodedState decoded;
-            string decodeError = "state codec unavailable";
-            if (m_stateCodec == null
-                || !PlacementGhostWireCodec.TryDecode(peer.Payload, m_stateCodec, out decoded, out decodeError)) {
+            string decodeError = "preview codec unavailable";
+            if (m_previewCodec == null
+                || !PlacementGhostWireCodec.TryDecode(peer.Payload, m_previewCodec, out decoded, out decodeError)) {
 
                 Log.Info(
                     "COI-Coop: PREVIEW GHOST RX FAIL rev=" + peer.Revision
@@ -400,6 +408,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_discovery = null;
         m_sandboxDiscovery = null;
         m_stateCodec = null;
+        m_previewCodec = null;
         m_simLoop = null;
         m_gameLoop = null;
     }
