@@ -17,8 +17,8 @@ $zipPath = Join-Path $distRoot "COI-Coop-Internet-Client.zip"
 
 $relayBase = $RelayUrl.Trim().TrimEnd('/')
 $relayUri = $null
-if (-not [Uri]::TryCreate($relayBase, [UriKind]::Absolute, [ref]$relayUri)
-    -or ($relayUri.Scheme -ne "https" -and $relayUri.Scheme -ne "http")) {
+$relayUriIsValid = [Uri]::TryCreate($relayBase, [UriKind]::Absolute, [ref]$relayUri)
+if (-not $relayUriIsValid -or ($relayUri.Scheme -ne "https" -and $relayUri.Scheme -ne "http")) {
     throw "RelayUrl must be a valid https:// URL (or http:// for local development)."
 }
 
