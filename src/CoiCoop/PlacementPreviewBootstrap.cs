@@ -1,24 +1,26 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 using CoiCoop.Networking;
 using Mafi;
+using Mafi.Core;
+using Mafi.Core.GameLoop;
+using Mafi.Core.Prototypes;
 using Mafi.Core.Simulation;
 
 namespace CoiCoop;
 
 /// <summary>
-/// Auxiliary co-op sidecar for presentation-only placement telemetry and the
-/// targeted sandbox ProductsSource state adapter.
+/// Auxiliary co-op sidecar for presentation-only building placement ghosts and
+/// targeted sandbox source/sink state adapters.
 ///
-/// The sidecar is deliberately independent from authoritative replay: failures
-/// here are logged but never halt simulation.
+/// Network/state sampling happens from the sim/UI-end hook. Actual ghost creation
+/// and transform updates happen only from IGameLoopEvents.RenderUpdate so Unity
+/// preview objects are never touched from the simulation thread.
 /// </summary>
 internal sealed class PlacementPreviewBootstrap : IDisposable {
     private const int PlacementSampleIntervalMs = 100;
     private const int SandboxSampleIntervalMs = 100;
-    private const int MaxLoggedObservationChars = 700;
-    private const string PlacementKind = "PLACEMENT_DELTA";
+    private const string PlacementKind = "PLACEMENT_GHOST";
     private const string SandboxKind = "SANDBOX_SOURCE";
 
     private static readonly object s_lock = new object();
@@ -31,14 +33,22 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
     private SandboxSourceDiscovery m_sandboxDiscovery;
     private CommandRoundTripProbe m_stateCodec;
     private PlacementPreviewSession m_session;
+    private RemotePlacementGhostRenderer m_remoteGhostRenderer;
     private ISimLoopEvents m_simLoop;
+    private IGameLoopEvents m_gameLoop;
     private int m_lastPlacementSampleMs;
     private int m_lastSandboxSampleMs;
     private int m_lastLoggedCandidateCount = -1;
     private int m_lastLoggedSandboxCandidateCount = -1;
-    private bool m_hooked;
+    private bool m_simHooked;
+    private bool m_renderHooked;
     private bool m_resolverObserved;
     private bool m_sandboxFailureLogged;
+    private bool m_localGhostVisible;
+    private bool m_localGhostFailureLogged;
+    private bool m_peerGhostVisible;
+    private string m_lastLocalGhostProtoKey;
+    private string m_lastPeerGhostProtoKey;
 
     private PlacementPreviewBootstrap(DependencyResolver resolver, int mode, int previewPort) {
         m_resolver = resolver;
@@ -67,6 +77,9 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         m_discovery = new PlacementPreviewDiscovery(m_resolver);
         m_sandboxDiscovery = new SandboxSourceDiscovery(m_resolver);
         m_stateCodec = new CommandRoundTripProbe(m_resolver);
+        m_remoteGhostRenderer = new RemotePlacementGhostRenderer(
+            m_resolver,
+            message => Log.Info("COI-Coop: " + message));
         m_session = new PlacementPreviewSession(
             m_mode == 1,
             m_previewPort,
@@ -78,7 +91,12 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
 
         ISimLoopEvents simLoop;
         if (m_resolver.TryGetResolvedDependency<ISimLoopEvents>(out simLoop) && simLoop != null) {
-            Attach(simLoop);
+            AttachSimLoop(simLoop);
+        }
+
+        IGameLoopEvents gameLoop;
+        if (m_resolver.TryGetResolvedDependency<IGameLoopEvents>(out gameLoop) && gameLoop != null) {
+            AttachGameLoop(gameLoop);
         }
 
         Log.Info(
@@ -90,7 +108,10 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         if (instance == null) return;
 
         var simLoop = instance as ISimLoopEvents;
-        if (simLoop != null) Attach(simLoop);
+        if (simLoop != null) AttachSimLoop(simLoop);
+
+        var gameLoop = instance as IGameLoopEvents;
+        if (gameLoop != null) AttachGameLoop(gameLoop);
 
         if (m_discovery != null && m_discovery.ObserveInstance(instance)) {
             Log.Info(
@@ -99,48 +120,108 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         }
     }
 
-    private void Attach(ISimLoopEvents simLoop) {
-        if (m_hooked || simLoop == null) return;
+    private void AttachSimLoop(ISimLoopEvents simLoop) {
+        if (m_simHooked || simLoop == null) return;
         m_simLoop = simLoop;
         m_simLoop.UpdateEndForUi.AddNonSaveable(this, OnUpdateEndForUi);
-        m_hooked = true;
+        m_simHooked = true;
         Log.Info("COI-Coop: PREVIEW lightweight UpdateEndForUi sampler attached");
+    }
+
+    private void AttachGameLoop(IGameLoopEvents gameLoop) {
+        if (m_renderHooked || gameLoop == null) return;
+        m_gameLoop = gameLoop;
+        m_gameLoop.RenderUpdate.AddNonSaveable(this, OnRenderUpdate);
+        m_renderHooked = true;
+        Log.Info("COI-Coop: REMOTE GHOST RenderUpdate hook attached");
+    }
+
+    private void OnRenderUpdate(GameTime gameTime) {
+        if (!ReferenceEquals(s_current, this)) return;
+        m_remoteGhostRenderer?.RenderUpdate();
     }
 
     private void OnUpdateEndForUi() {
         if (!ReferenceEquals(s_current, this) || m_session == null) return;
 
         PumpIncoming();
-        if (!m_session.IsConnected) return;
+        if (!m_session.IsConnected) {
+            if (m_peerGhostVisible) {
+                m_peerGhostVisible = false;
+                m_remoteGhostRenderer?.Clear();
+            }
+            return;
+        }
 
         SamplePlacementPreview();
         SampleSandboxSources();
     }
 
     private void SamplePlacementPreview() {
-        if (m_discovery == null) return;
+        if (m_discovery == null || m_stateCodec == null) return;
 
         var changedCandidates = m_discovery.RefreshResolvedCandidates();
         if (changedCandidates || m_lastLoggedCandidateCount != m_discovery.CandidateCount) {
             m_lastLoggedCandidateCount = m_discovery.CandidateCount;
             Log.Info(
                 "COI-Coop: PREVIEW targeted candidates=" + m_discovery.CandidateCount
-                + " [" + Truncate(m_discovery.CandidateSummary) + "]");
+                + " [" + m_discovery.CandidateSummary + "]");
         }
 
         var now = Environment.TickCount;
         if (unchecked(now - m_lastPlacementSampleMs) < PlacementSampleIntervalMs) return;
         m_lastPlacementSampleMs = now;
 
-        string observation;
-        if (!m_discovery.TryCaptureChanged(out observation)) return;
+        Proto prototype;
+        TileTransform transform;
+        string captureError;
+        if (!m_discovery.TryCaptureBuildingGhost(out prototype, out transform, out captureError)) {
+            if (m_localGhostVisible) {
+                m_session.Clear();
+                m_localGhostVisible = false;
+                m_lastLocalGhostProtoKey = null;
+                Log.Info("COI-Coop: PREVIEW GHOST TX CLEAR");
+            }
 
-        var payload = Encoding.UTF8.GetBytes(observation);
+            // No active placer is the normal steady state, not an error.
+            if (!string.Equals(captureError, "no active StaticEntityMassPlacer", StringComparison.Ordinal)
+                && !m_localGhostFailureLogged) {
+                m_localGhostFailureLogged = true;
+                Log.Info("COI-Coop: PREVIEW GHOST CAPTURE WAIT - " + captureError);
+            }
+            return;
+        }
+
+        m_localGhostFailureLogged = false;
+
+        byte[] payload;
+        string encodeError;
+        if (!PlacementGhostWireCodec.TryEncode(
+                prototype,
+                transform,
+                m_stateCodec,
+                out payload,
+                out encodeError)) {
+
+            if (!m_localGhostFailureLogged) {
+                m_localGhostFailureLogged = true;
+                Log.Info("COI-Coop: PREVIEW GHOST ENCODE FAIL - " + encodeError);
+            }
+            return;
+        }
+
         var revision = m_session.Publish(PlacementKind, payload);
-        Log.Info(
-            "COI-Coop: PREVIEW DELTA TX rev=" + revision
-            + " bytes=" + payload.Length
-            + " " + Truncate(observation));
+        m_localGhostVisible = true;
+
+        var protoKey = GetProtoKey(prototype);
+        if (!string.Equals(protoKey, m_lastLocalGhostProtoKey, StringComparison.Ordinal)) {
+            m_lastLocalGhostProtoKey = protoKey;
+            Log.Info(
+                "COI-Coop: PREVIEW GHOST TX START rev=" + revision
+                + " proto=" + protoKey
+                + " bytes=" + payload.Length
+                + " transform=" + transform);
+        }
     }
 
     private void SampleSandboxSources() {
@@ -154,7 +235,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         if (changedCandidates || m_lastLoggedSandboxCandidateCount != m_sandboxDiscovery.CandidateCount) {
             m_lastLoggedSandboxCandidateCount = m_sandboxDiscovery.CandidateCount;
             Log.Info(
-                "COI-Coop: SANDBOX targeted ProductsSource candidates="
+                "COI-Coop: SANDBOX targeted endpoint candidates="
                 + m_sandboxDiscovery.CandidateCount);
         }
 
@@ -195,7 +276,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
                 continue;
             }
 
-            string error = "sandbox source adapter or state codec is unavailable";
+            string error = "sandbox adapter or state codec is unavailable";
             if (m_sandboxDiscovery == null
                 || m_stateCodec == null
                 || !m_sandboxDiscovery.TryApplyRemote(entityId, valuePayload, m_stateCodec, out error)) {
@@ -218,7 +299,12 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             if (peer == null) continue;
 
             if (string.Equals(peer.Kind, "NONE", StringComparison.Ordinal)) {
-                Log.Info("COI-Coop: PREVIEW RX CLEAR rev=" + peer.Revision);
+                if (m_peerGhostVisible) {
+                    m_peerGhostVisible = false;
+                    m_lastPeerGhostProtoKey = null;
+                    m_remoteGhostRenderer?.Clear();
+                    Log.Info("COI-Coop: PREVIEW GHOST RX CLEAR rev=" + peer.Revision);
+                }
                 continue;
             }
 
@@ -226,18 +312,29 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
                 continue;
             }
 
-            string observation;
-            try {
-                observation = Encoding.UTF8.GetString(peer.Payload ?? Array.Empty<byte>());
-            }
-            catch {
-                observation = "<invalid utf8 payload>";
+            PlacementGhostWireCodec.DecodedState decoded;
+            string decodeError;
+            if (m_stateCodec == null
+                || !PlacementGhostWireCodec.TryDecode(peer.Payload, m_stateCodec, out decoded, out decodeError)) {
+
+                Log.Info(
+                    "COI-Coop: PREVIEW GHOST RX FAIL rev=" + peer.Revision
+                    + " error=" + decodeError);
+                continue;
             }
 
-            Log.Info(
-                "COI-Coop: PREVIEW DELTA RX rev=" + peer.Revision
-                + " bytes=" + (peer.Payload?.Length ?? 0)
-                + " " + Truncate(observation));
+            m_peerGhostVisible = true;
+            m_remoteGhostRenderer?.Publish(decoded.Prototype, decoded.Transform);
+
+            var protoKey = GetProtoKey(decoded.Prototype);
+            if (!string.Equals(protoKey, m_lastPeerGhostProtoKey, StringComparison.Ordinal)) {
+                m_lastPeerGhostProtoKey = protoKey;
+                Log.Info(
+                    "COI-Coop: PREVIEW GHOST RX START rev=" + peer.Revision
+                    + " proto=" + protoKey
+                    + " bytes=" + (peer.Payload?.Length ?? 0)
+                    + " transform=" + decoded.Transform);
+            }
         }
     }
 
@@ -269,11 +366,10 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
         return true;
     }
 
-    private static string Truncate(string value) {
-        value = value ?? string.Empty;
-        return value.Length <= MaxLoggedObservationChars
-            ? value
-            : value.Substring(0, MaxLoggedObservationChars) + "...";
+    private static string GetProtoKey(Proto prototype) {
+        if (prototype == null) return "<null>";
+        try { return prototype.GetType().Name + "#" + prototype.Id; }
+        catch { return prototype.GetType().Name; }
     }
 
     private static int ReadEnvironmentInt(string name, int fallback) {
@@ -286,12 +382,25 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             try { m_resolver.ObjectInstantiated -= OnObjectInstantiated; } catch { }
         }
         m_resolverObserved = false;
+
+        if (m_simLoop != null && m_simHooked) {
+            try { m_simLoop.UpdateEndForUi.RemoveNonSaveable(this, OnUpdateEndForUi); } catch { }
+        }
+        if (m_gameLoop != null && m_renderHooked) {
+            try { m_gameLoop.RenderUpdate.RemoveNonSaveable(this, OnRenderUpdate); } catch { }
+        }
+        m_simHooked = false;
+        m_renderHooked = false;
+
+        m_remoteGhostRenderer?.Clear();
+        m_remoteGhostRenderer?.Dispose();
+        m_remoteGhostRenderer = null;
         m_session?.Dispose();
         m_session = null;
         m_discovery = null;
         m_sandboxDiscovery = null;
         m_stateCodec = null;
         m_simLoop = null;
-        m_hooked = false;
+        m_gameLoop = null;
     }
 }
