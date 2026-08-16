@@ -10,16 +10,18 @@ using Mafi.Core.Prototypes;
 namespace CoiCoop;
 
 /// <summary>
-/// Targeted runtime bridge for COI 0.8.7 building placement.
+/// Targeted runtime bridge for COI 0.8.7 ordinary building placement.
 ///
 /// Unlike the old diagnostic scanner, this class never walks all Unity objects and
 /// never serializes reflection dumps. It keeps only the handful of known placement
-/// controller instances and, while one StaticEntityMassPlacer is active, reads the
-/// exact m_helper.Transform plus the first active preview's EntityProto.
+/// controller instances. Single placements still use the proven helper transform;
+/// multi-entity mass placements read the active placer's m_entityPreviews set so
+/// drag rows / duplicated buildings / blueprints can be mirrored piece-by-piece.
 /// </summary>
 internal sealed class PlacementPreviewDiscovery {
     private const string MassPlacerTypeName
         = "Mafi.Unity.Ui.Controllers.LayoutEntityPlacing.StaticEntityMassPlacer";
+    private const int MaxMultiPreviewPieces = 256;
 
     private static readonly string[] TargetTypeNames = {
         MassPlacerTypeName,
@@ -28,6 +30,24 @@ internal sealed class PlacementPreviewDiscovery {
         "Mafi.Unity.InputControl.Factory.LayoutEntityPreviewManager",
         "Mafi.Unity.UiStatic.Controllers.LayoutEntityPlacing.LastUsedStaticEntityTransform"
     };
+
+    internal sealed class Piece {
+        public Proto Prototype { get; }
+        public TileTransform Transform { get; }
+
+        public Piece(Proto prototype, TileTransform transform) {
+            Prototype = prototype;
+            Transform = transform;
+        }
+    }
+
+    internal sealed class CapturedSet {
+        public IReadOnlyList<Piece> Pieces { get; }
+
+        public CapturedSet(IReadOnlyList<Piece> pieces) {
+            Pieces = pieces;
+        }
+    }
 
     private sealed class Candidate {
         public int Id { get; }
@@ -108,9 +128,91 @@ internal sealed class PlacementPreviewDiscovery {
     }
 
     /// <summary>
+    /// Captures a multi-entity ordinary placement from StaticEntityMassPlacer.
+    /// Vanilla stores m_entityPreviews as KeyValuePair&lt;IStaticEntityPreview,
+    /// EntityConfigData&gt;. EntityConfigData carries the individual prototype and
+    /// transform that ultimately become BatchCreateStaticEntitiesCmd items.
+    ///
+    /// We only claim this path when there are at least two live preview entries;
+    /// ordinary single-object placement remains on TryCaptureBuildingGhost().
+    /// </summary>
+    public bool TryCaptureBuildingGhostSet(out CapturedSet state, out string error) {
+        state = null;
+        error = "no active multi-entity StaticEntityMassPlacer";
+
+        Candidate active;
+        if (!TryGetActiveMassPlacer(out active)) return false;
+
+        object previewsValue;
+        if (!TryReadMember(active.Instance, "m_entityPreviews", out previewsValue)
+            || previewsValue == null) {
+            error = "active StaticEntityMassPlacer.m_entityPreviews was not found";
+            return false;
+        }
+
+        var enumerable = previewsValue as IEnumerable;
+        if (enumerable == null) {
+            error = "active StaticEntityMassPlacer.m_entityPreviews is not enumerable";
+            return false;
+        }
+
+        var pieces = new List<Piece>();
+        foreach (var item in enumerable) {
+            if (item == null) continue;
+            if (pieces.Count >= MaxMultiPreviewPieces) {
+                error = "active mass placement has more than " + MaxMultiPreviewPieces + " preview pieces";
+                return false;
+            }
+
+            object key = null;
+            object value = null;
+            TryReadMember(item, "Key", out key);
+            TryReadMember(item, "Value", out value);
+
+            Proto prototype = null;
+            object entityProto;
+            if (key != null
+                && TryReadMember(key, "EntityProto", out entityProto)
+                && entityProto is Proto directProto) {
+                prototype = directProto;
+            }
+            if (prototype == null && value != null) {
+                TryExtractPrototype(
+                    value,
+                    2,
+                    new HashSet<object>(ReferenceEqualityComparer.Instance),
+                    out prototype);
+            }
+
+            TileTransform transform;
+            var foundTransform = value != null && TryExtractTileTransform(value, out transform);
+            if (!foundTransform && key != null) {
+                foundTransform = TryExtractTileTransform(key, out transform);
+            }
+
+            if (prototype == null || !foundTransform) {
+                error = "could not read proto/transform from mass placement preview element "
+                    + item.GetType().FullName;
+                return false;
+            }
+
+            pieces.Add(new Piece(prototype, transform));
+        }
+
+        if (pieces.Count < 2) {
+            error = "active StaticEntityMassPlacer has fewer than two preview pieces";
+            return false;
+        }
+
+        state = new CapturedSet(pieces);
+        error = null;
+        return true;
+    }
+
+    /// <summary>
     /// Captures one ordinary building ghost from the currently active
-    /// StaticEntityMassPlacer. Blueprint/multi-entity and transport drag previews are
-    /// deliberately left for later protocol variants.
+    /// StaticEntityMassPlacer. The helper transform is deliberately retained for
+    /// the single-object path because it is the exact live cursor transform.
     /// </summary>
     public bool TryCaptureBuildingGhost(
         out Proto prototype,
@@ -121,24 +223,8 @@ internal sealed class PlacementPreviewDiscovery {
         transform = default(TileTransform);
         error = null;
 
-        Candidate active = null;
-        foreach (var candidate in m_candidates) {
-            if (!string.Equals(candidate.Type.FullName, MassPlacerTypeName, StringComparison.Ordinal)) {
-                continue;
-            }
-
-            object activeValue;
-            if (!TryReadMember(candidate.Instance, "IsActive", out activeValue)
-                || !(activeValue is bool isActive)
-                || !isActive) {
-                continue;
-            }
-
-            active = candidate;
-            break;
-        }
-
-        if (active == null) {
+        Candidate active;
+        if (!TryGetActiveMassPlacer(out active)) {
             error = "no active StaticEntityMassPlacer";
             return false;
         }
@@ -176,6 +262,26 @@ internal sealed class PlacementPreviewDiscovery {
         return false;
     }
 
+    private bool TryGetActiveMassPlacer(out Candidate active) {
+        active = null;
+        foreach (var candidate in m_candidates) {
+            if (!string.Equals(candidate.Type.FullName, MassPlacerTypeName, StringComparison.Ordinal)) {
+                continue;
+            }
+
+            object activeValue;
+            if (!TryReadMember(candidate.Instance, "IsActive", out activeValue)
+                || !(activeValue is bool isActive)
+                || !isActive) {
+                continue;
+            }
+
+            active = candidate;
+            return true;
+        }
+        return false;
+    }
+
     private static bool TryExtractPrototypeFromPreviews(object previews, out Proto prototype) {
         prototype = null;
         var enumerable = previews as IEnumerable;
@@ -202,6 +308,70 @@ internal sealed class PlacementPreviewDiscovery {
                     2,
                     new HashSet<object>(ReferenceEqualityComparer.Instance),
                     out prototype)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool TryExtractTileTransform(object value, out TileTransform transform) {
+        transform = default(TileTransform);
+        if (value == null) return false;
+        if (value is TileTransform direct) {
+            transform = direct;
+            return true;
+        }
+
+        string[] preferredNames = { "Transform", "m_transform", "EntityTransform", "TileTransform" };
+        for (var i = 0; i < preferredNames.Length; i++) {
+            object memberValue;
+            if (TryReadMember(value, preferredNames[i], out memberValue)
+                && memberValue is TileTransform preferred) {
+                transform = preferred;
+                return true;
+            }
+        }
+
+        for (var current = value.GetType(); current != null && current != typeof(object); current = current.BaseType) {
+            FieldInfo[] fields;
+            try {
+                fields = current.GetFields(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            }
+            catch {
+                fields = Array.Empty<FieldInfo>();
+            }
+            for (var i = 0; i < fields.Length; i++) {
+                if (fields[i].IsStatic) continue;
+                var fieldType = Nullable.GetUnderlyingType(fields[i].FieldType) ?? fields[i].FieldType;
+                if (fieldType != typeof(TileTransform)) continue;
+                object fieldValue;
+                try { fieldValue = fields[i].GetValue(value); }
+                catch { continue; }
+                if (fieldValue is TileTransform fieldTransform) {
+                    transform = fieldTransform;
+                    return true;
+                }
+            }
+
+            PropertyInfo[] properties;
+            try {
+                properties = current.GetProperties(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            }
+            catch {
+                properties = Array.Empty<PropertyInfo>();
+            }
+            for (var i = 0; i < properties.Length; i++) {
+                if (properties[i].GetIndexParameters().Length != 0 || properties[i].GetGetMethod(true) == null) continue;
+                var propertyType = Nullable.GetUnderlyingType(properties[i].PropertyType) ?? properties[i].PropertyType;
+                if (propertyType != typeof(TileTransform)) continue;
+                object propertyValue;
+                try { propertyValue = properties[i].GetValue(value, null); }
+                catch { continue; }
+                if (propertyValue is TileTransform propertyTransform) {
+                    transform = propertyTransform;
                     return true;
                 }
             }
