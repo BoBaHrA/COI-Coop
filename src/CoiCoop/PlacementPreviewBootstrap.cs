@@ -313,7 +313,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
             }
 
             PlacementGhostWireCodec.DecodedState decoded;
-            string decodeError;
+            string decodeError = "state codec unavailable";
             if (m_stateCodec == null
                 || !PlacementGhostWireCodec.TryDecode(peer.Payload, m_stateCodec, out decoded, out decodeError)) {
 
