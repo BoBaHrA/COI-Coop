@@ -7,15 +7,11 @@ echo.
 if not "%COI_COOP_RELAY_URL%"=="" (
   set "RELAYURL=%COI_COOP_RELAY_URL%"
 ) else (
-  set /p "RELAYURL=Relay URL (https://...onrender.com): "
+  set "RELAYURL=https://coi-coop-relay.onrender.com"
 )
 
-if "%RELAYURL%"=="" (
-  echo Relay URL is required.
-  pause
-  exit /b 2
-)
-
+echo Relay: %RELAYURL%
+echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0launch-internet.ps1" -Mode Host -RelayUrl "%RELAYURL%"
 set "EXITCODE=%ERRORLEVEL%"
 
