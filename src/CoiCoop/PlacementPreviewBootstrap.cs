@@ -195,7 +195,7 @@ internal sealed class PlacementPreviewBootstrap : IDisposable {
                 continue;
             }
 
-            string error;
+            string error = "sandbox source adapter or state codec is unavailable";
             if (m_sandboxDiscovery == null
                 || m_stateCodec == null
                 || !m_sandboxDiscovery.TryApplyRemote(entityId, valuePayload, m_stateCodec, out error)) {
