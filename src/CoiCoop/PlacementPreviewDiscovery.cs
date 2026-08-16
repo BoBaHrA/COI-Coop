@@ -184,7 +184,7 @@ internal sealed class PlacementPreviewDiscovery {
                     out prototype);
             }
 
-            TileTransform transform;
+            TileTransform transform = default(TileTransform);
             var foundTransform = value != null && TryExtractTileTransform(value, out transform);
             if (!foundTransform && key != null) {
                 foundTransform = TryExtractTileTransform(key, out transform);
