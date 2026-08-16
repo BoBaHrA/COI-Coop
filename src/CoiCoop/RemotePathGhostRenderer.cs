@@ -95,11 +95,11 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
 
             // Bridges have one extra piece of presentation state that transports
             // and train tracks do not: PathFindingBridgePreview must know the
-            // BridgeProto used for the start connection. Vanilla BridgeBuildController
-            // supplies this through SetStartConnectionType(). Without it the Show*
-            // calls can succeed without producing any visible bridge geometry.
+            // BridgeProto used for the start connection. Protocol v3 carries that
+            // exact proto from the peer's active BridgeBuildController so bridge
+            // and ramp variants do not have to be guessed on the receiving peer.
             if (string.Equals(state.Family, PathPreviewDiscovery.BridgeFamily, StringComparison.Ordinal)
-                && !PrepareBridgePreview(state.Request)) {
+                && !PrepareBridgePreview(state)) {
                 return;
             }
 
@@ -110,7 +110,7 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
                 // Activate may reset presentation state on some game versions, so
                 // re-apply the bridge connection type before the first Show call.
                 if (string.Equals(state.Family, PathPreviewDiscovery.BridgeFamily, StringComparison.Ordinal)
-                    && !PrepareBridgePreview(state.Request)) {
+                    && !PrepareBridgePreview(state)) {
                     return;
                 }
 
@@ -138,8 +138,8 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
         }
     }
 
-    private bool PrepareBridgePreview(object request) {
-        if (m_preview == null || request == null) return false;
+    private bool PrepareBridgePreview(PathPreviewWireCodec.DecodedState state) {
+        if (m_preview == null || state == null || state.Request == null) return false;
 
         var bridgeProtoType = FindLoadedType(BridgeProtoTypeName);
         if (bridgeProtoType == null) {
@@ -147,12 +147,18 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
             return false;
         }
 
-        if (m_bridgeStartProto == null || !bridgeProtoType.IsInstanceOfType(m_bridgeStartProto)) {
+        // Prefer the exact proto transmitted by the player who owns the active
+        // bridge tool. This is the only reliable source when the receiving player
+        // is not currently using BridgeBuildController themselves.
+        if (state.BridgeProto != null && bridgeProtoType.IsInstanceOfType(state.BridgeProto)) {
+            m_bridgeStartProto = state.BridgeProto;
+        }
+        else if (m_bridgeStartProto == null || !bridgeProtoType.IsInstanceOfType(m_bridgeStartProto)) {
             object bridgeProto;
-            if (!TryFindBridgeProtoFromRequest(request, bridgeProtoType, out bridgeProto)
+            if (!TryFindBridgeProtoFromRequest(state.Request, bridgeProtoType, out bridgeProto)
                 && !TryGetBridgeProtoFromController(bridgeProtoType, out bridgeProto)) {
 
-                LogBridgeContextWait("BridgeProto could not be resolved from PreviewRequest/controller");
+                LogBridgeContextWait("sender did not provide BridgeProto and local fallback could not resolve it");
                 return false;
             }
             m_bridgeStartProto = bridgeProto;
@@ -172,7 +178,7 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
 
         m_setStartConnectionType.Invoke(m_preview, new[] { m_bridgeStartProto });
         if (m_bridgeContextWaitLogged) {
-            m_log?.Invoke("REMOTE PATH GHOST bridge connection type resolved");
+            m_log?.Invoke("REMOTE PATH GHOST bridge connection type resolved from sender");
         }
         m_bridgeContextWaitLogged = false;
         return true;
@@ -189,9 +195,6 @@ internal sealed class RemotePathGhostRenderer : IDisposable {
             return true;
         }
 
-        // Start requests carry the exact segment prototypes selected by the local
-        // player. Search those first, then the current/existing BridgePlan. The
-        // search is intentionally shallow and capped so this remains render-safe.
         if (TryReadMember(request, "ProtosToPlace", out value)
             && TryFindValueOfType(value, bridgeProtoType, 2, out bridgeProto)) {
             return true;
