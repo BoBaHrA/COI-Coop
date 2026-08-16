@@ -58,12 +58,7 @@ Write-Host ""
 
 if ($Mode -eq "Host") {
     Write-Host "Creating co-op session..."
-    $response = Invoke-RestMethod \
-        -Method Post \
-        -Uri "$baseUrl/api/session" \
-        -ContentType "application/json" \
-        -Body "{}" \
-        -TimeoutSec 60
+    $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session" -ContentType "application/json" -Body "{}" -TimeoutSec 60
 
     $code = Normalize-SessionCode ([string]$response.code)
     $token = [string]$response.hostToken
@@ -93,12 +88,7 @@ else {
     }
 
     Write-Host "Joining session $code..."
-    $response = Invoke-RestMethod \
-        -Method Post \
-        -Uri "$baseUrl/api/session/$code/join" \
-        -ContentType "application/json" \
-        -Body "{}" \
-        -TimeoutSec 60
+    $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session/$code/join" -ContentType "application/json" -Body "{}" -TimeoutSec 60
 
     $token = [string]$response.clientToken
     $expiresAt = [string]$response.expiresAt
