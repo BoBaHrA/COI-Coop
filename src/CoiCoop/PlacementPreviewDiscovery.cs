@@ -1,47 +1,50 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Text;
 using Mafi;
+using Mafi.Core;
+using Mafi.Core.Prototypes;
 
 namespace CoiCoop;
 
 /// <summary>
-/// Lightweight runtime bridge for the handful of COI 0.8.7 placement objects
-/// observed during live testing. The previous broad scanner sampled dozens of
-/// unrelated controllers and built ~18 KB reflection snapshots on the game
-/// thread; this version keeps only targeted layout-placement types and emits
-/// field deltas rather than whole-object dumps.
+/// Targeted runtime bridge for COI 0.8.7 building placement.
+///
+/// Unlike the old diagnostic scanner, this class never walks all Unity objects and
+/// never serializes reflection dumps. It keeps only the handful of known placement
+/// controller instances and, while one StaticEntityMassPlacer is active, reads the
+/// exact m_helper.Transform plus the first active preview's EntityProto.
 /// </summary>
 internal sealed class PlacementPreviewDiscovery {
-    private sealed class Candidate {
-        public int Id { get; }
-        public Type Type { get; }
-        public object Instance { get; }
-        public FieldInfo[] Fields { get; }
-        public Dictionary<FieldInfo, string> LastValues { get; }
-            = new Dictionary<FieldInfo, string>();
-        public bool BaselineReady { get; set; }
-
-        public Candidate(int id, Type type, object instance, FieldInfo[] fields) {
-            Id = id;
-            Type = type;
-            Instance = instance;
-            Fields = fields;
-        }
-    }
+    private const string MassPlacerTypeName
+        = "Mafi.Unity.Ui.Controllers.LayoutEntityPlacing.StaticEntityMassPlacer";
 
     private static readonly string[] TargetTypeNames = {
-        "Mafi.Unity.Ui.Controllers.LayoutEntityPlacing.StaticEntityMassPlacer",
+        MassPlacerTypeName,
         "Mafi.Unity.Ui.Controllers.LayoutEntityPlacing.LayoutEntitySlotPlacerHelper",
         "Mafi.Unity.Ui.Controllers.LayoutEntityPlacing.LayoutEntityToolbox",
         "Mafi.Unity.InputControl.Factory.LayoutEntityPreviewManager",
         "Mafi.Unity.UiStatic.Controllers.LayoutEntityPlacing.LastUsedStaticEntityTransform"
     };
 
+    private sealed class Candidate {
+        public int Id { get; }
+        public Type Type { get; }
+        public object Instance { get; }
+
+        public Candidate(int id, Type type, object instance) {
+            Id = id;
+            Type = type;
+            Instance = instance;
+        }
+    }
+
     private readonly DependencyResolver m_resolver;
     private readonly List<Candidate> m_candidates = new List<Candidate>();
-    private readonly HashSet<object> m_candidateInstances = new HashSet<object>(ReferenceEqualityComparer.Instance);
+    private readonly HashSet<object> m_candidateInstances
+        = new HashSet<object>(ReferenceEqualityComparer.Instance);
     private int m_nextCandidateId;
     private bool m_initialResolveAttempted;
 
@@ -55,22 +58,16 @@ internal sealed class PlacementPreviewDiscovery {
     public string CandidateSummary {
         get {
             if (m_candidates.Count == 0) return "none";
-            var builder = new StringBuilder(512);
+            var builder = new StringBuilder(256);
             var shown = 0;
             foreach (var candidate in m_candidates) {
-                if (shown++ >= 12) {
+                if (shown++ >= 16) {
                     builder.Append(" ...");
                     break;
                 }
                 if (builder.Length > 0) builder.Append(", ");
                 builder.Append('#').Append(candidate.Id)
-                    .Append(':').Append(candidate.Type.Name)
-                    .Append('[');
-                for (var i = 0; i < candidate.Fields.Length; i++) {
-                    if (i > 0) builder.Append(',');
-                    builder.Append(candidate.Fields[i].Name);
-                }
-                builder.Append(']');
+                    .Append(':').Append(candidate.Type.Name);
             }
             return builder.ToString();
         }
@@ -83,10 +80,6 @@ internal sealed class PlacementPreviewDiscovery {
         return TryAddCandidate(type, instance);
     }
 
-    /// <summary>
-    /// Resolve the known target types directly by full name. No assembly GetTypes
-    /// walk and no resolver-container traversal are performed.
-    /// </summary>
     public bool RefreshResolvedCandidates(bool force = false) {
         if (m_initialResolveAttempted && !force) return false;
         m_initialResolveAttempted = true;
@@ -115,59 +108,195 @@ internal sealed class PlacementPreviewDiscovery {
     }
 
     /// <summary>
-    /// Returns only fields whose formatted value changed after the baseline.
-    /// Typical payload is tens/hundreds of bytes instead of the previous 18 KB.
+    /// Captures one ordinary building ghost from the currently active
+    /// StaticEntityMassPlacer. Blueprint/multi-entity and transport drag previews are
+    /// deliberately left for later protocol variants.
     /// </summary>
-    public bool TryCaptureChanged(out string observation) {
-        observation = null;
-        if (m_candidates.Count == 0) return false;
+    public bool TryCaptureBuildingGhost(
+        out Proto prototype,
+        out TileTransform transform,
+        out string error) {
 
-        var builder = new StringBuilder(256);
+        prototype = null;
+        transform = default(TileTransform);
+        error = null;
+
+        Candidate active = null;
         foreach (var candidate in m_candidates) {
-            var candidateBuilder = new StringBuilder(128);
-            var hadBaseline = candidate.BaselineReady;
-
-            foreach (var field in candidate.Fields) {
-                object value;
-                try { value = field.GetValue(candidate.Instance); }
-                catch { continue; }
-
-                string formatted;
-                if (!TryFormatValue(value, out formatted)) continue;
-
-                string previous;
-                var hasPrevious = candidate.LastValues.TryGetValue(field, out previous);
-                candidate.LastValues[field] = formatted;
-
-                if (!hadBaseline || !hasPrevious || string.Equals(previous, formatted, StringComparison.Ordinal)) {
-                    continue;
-                }
-
-                candidateBuilder.Append('|').Append(field.Name).Append('=').Append(formatted);
+            if (!string.Equals(candidate.Type.FullName, MassPlacerTypeName, StringComparison.Ordinal)) {
+                continue;
             }
 
-            candidate.BaselineReady = true;
-            if (candidateBuilder.Length == 0) continue;
+            object activeValue;
+            if (!TryReadMember(candidate.Instance, "IsActive", out activeValue)
+                || !(activeValue is bool isActive)
+                || !isActive) {
+                continue;
+            }
 
-            if (builder.Length > 0) builder.Append(" || ");
-            builder.Append('#').Append(candidate.Id)
-                .Append(':').Append(candidate.Type.FullName)
-                .Append(candidateBuilder);
+            active = candidate;
+            break;
         }
 
-        if (builder.Length == 0) return false;
-        observation = builder.ToString();
-        return true;
+        if (active == null) {
+            error = "no active StaticEntityMassPlacer";
+            return false;
+        }
+
+        object helper;
+        if (!TryReadMember(active.Instance, "m_helper", out helper) || helper == null) {
+            error = "active StaticEntityMassPlacer.m_helper was not found";
+            return false;
+        }
+
+        object transformValue;
+        if (!TryReadMember(helper, "Transform", out transformValue)
+            || !(transformValue is TileTransform capturedTransform)) {
+            error = "active placement helper Transform was not available";
+            return false;
+        }
+
+        object previews;
+        if (TryReadMember(active.Instance, "m_entityPreviews", out previews)
+            && TryExtractPrototypeFromPreviews(previews, out prototype)) {
+
+            transform = capturedTransform;
+            return true;
+        }
+
+        // Version-tolerant fallback: inspect only the single active placer and at
+        // most two shallow levels looking for a Proto reference. This is tiny
+        // compared with the removed all-world reflection scanner.
+        if (TryExtractPrototype(active.Instance, 2, new HashSet<object>(ReferenceEqualityComparer.Instance), out prototype)) {
+            transform = capturedTransform;
+            return true;
+        }
+
+        error = "active StaticEntityMassPlacer prototype was not found";
+        return false;
+    }
+
+    private static bool TryExtractPrototypeFromPreviews(object previews, out Proto prototype) {
+        prototype = null;
+        var enumerable = previews as IEnumerable;
+        if (enumerable == null) return false;
+
+        var inspected = 0;
+        foreach (var item in enumerable) {
+            if (item == null) continue;
+            if (++inspected > 16) break;
+
+            object key;
+            if (TryReadMember(item, "Key", out key) && key != null) {
+                object entityProto;
+                if (TryReadMember(key, "EntityProto", out entityProto) && entityProto is Proto direct) {
+                    prototype = direct;
+                    return true;
+                }
+            }
+
+            object value;
+            if (TryReadMember(item, "Value", out value) && value != null) {
+                if (TryExtractPrototype(
+                    value,
+                    2,
+                    new HashSet<object>(ReferenceEqualityComparer.Instance),
+                    out prototype)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool TryExtractPrototype(
+        object value,
+        int remainingDepth,
+        HashSet<object> visited,
+        out Proto prototype) {
+
+        prototype = value as Proto;
+        if (prototype != null) return true;
+        if (value == null || remainingDepth < 0) return false;
+
+        var type = value.GetType();
+        if (!type.IsValueType) {
+            if (visited.Contains(value)) return false;
+            visited.Add(value);
+        }
+
+        // Handle Mafi.Option<T> and similar wrappers without knowing T.
+        object hasValue;
+        if (TryReadMember(value, "HasValue", out hasValue) && hasValue is bool has && has) {
+            object optionValue;
+            if ((TryReadMember(value, "ValueOrNull", out optionValue)
+                    || TryReadMember(value, "Value", out optionValue))
+                && optionValue != null
+                && TryExtractPrototype(optionValue, remainingDepth - 1, visited, out prototype)) {
+                return true;
+            }
+        }
+
+        if (remainingDepth == 0) return false;
+
+        if (!(value is string) && value is IEnumerable enumerable) {
+            var count = 0;
+            foreach (var item in enumerable) {
+                if (++count > 16) break;
+                if (item != null
+                    && TryExtractPrototype(item, remainingDepth - 1, visited, out prototype)) {
+                    return true;
+                }
+            }
+        }
+
+        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
+            foreach (var field in current.GetFields(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
+
+                if (field.IsStatic || typeof(Delegate).IsAssignableFrom(field.FieldType)) continue;
+                if (!LooksPrototypeRelated(field.Name, field.FieldType)) continue;
+
+                object nested;
+                try { nested = field.GetValue(value); }
+                catch { continue; }
+                if (nested != null
+                    && TryExtractPrototype(nested, remainingDepth - 1, visited, out prototype)) {
+                    return true;
+                }
+            }
+        }
+
+        foreach (var property in type.GetProperties(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
+
+            if (property.GetIndexParameters().Length != 0 || property.GetGetMethod(true) == null) continue;
+            if (!LooksPrototypeRelated(property.Name, property.PropertyType)) continue;
+
+            object nested;
+            try { nested = property.GetValue(value, null); }
+            catch { continue; }
+            if (nested != null
+                && TryExtractPrototype(nested, remainingDepth - 1, visited, out prototype)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool LooksPrototypeRelated(string memberName, Type memberType) {
+        if (typeof(Proto).IsAssignableFrom(memberType)) return true;
+        var combined = (memberName ?? string.Empty) + " " + (memberType?.FullName ?? string.Empty);
+        return combined.IndexOf("proto", StringComparison.OrdinalIgnoreCase) >= 0
+            || combined.IndexOf("preview", StringComparison.OrdinalIgnoreCase) >= 0
+            || combined.IndexOf("config", StringComparison.OrdinalIgnoreCase) >= 0
+            || combined.IndexOf("entity", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private bool TryAddCandidate(Type type, object instance) {
         if (type == null || instance == null || m_candidateInstances.Contains(instance)) return false;
-
-        var fields = GetInterestingFields(type);
-        if (fields.Length == 0) return false;
-
         m_candidateInstances.Add(instance);
-        m_candidates.Add(new Candidate(m_nextCandidateId++, type, instance, fields));
+        m_candidates.Add(new Candidate(m_nextCandidateId++, type, instance));
         return true;
     }
 
@@ -180,90 +309,24 @@ internal sealed class PlacementPreviewDiscovery {
         return false;
     }
 
-    private static FieldInfo[] GetInterestingFields(Type type) {
-        var result = new List<FieldInfo>();
-        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            foreach (var field in current.GetFields(
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
+    private static bool TryReadMember(object instance, string name, out object value) {
+        value = null;
+        if (instance == null || string.IsNullOrEmpty(name)) return false;
 
-                if (field.IsStatic || typeof(Delegate).IsAssignableFrom(field.FieldType)) continue;
-                if (!LooksLikePlacementField(field.Name, field.FieldType)) continue;
-                result.Add(field);
+        for (var current = instance.GetType(); current != null && current != typeof(object); current = current.BaseType) {
+            var field = current.GetField(
+                name,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (field != null) {
+                try { value = field.GetValue(instance); return true; }
+                catch { return false; }
             }
-        }
 
-        result.Sort((a, b) => {
-            var declaring = string.CompareOrdinal(
-                a.DeclaringType?.FullName ?? string.Empty,
-                b.DeclaringType?.FullName ?? string.Empty);
-            return declaring != 0 ? declaring : string.CompareOrdinal(a.Name, b.Name);
-        });
-        return result.ToArray();
-    }
-
-    private static bool LooksLikePlacementField(string fieldName, Type fieldType) {
-        var combined = (fieldName ?? string.Empty) + " " + (fieldType?.FullName ?? string.Empty);
-        return combined.IndexOf("tile", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("position", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("rotation", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("orientation", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("direction", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("transform", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("prototype", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("proto", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("layout", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("cursor", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("selected", StringComparison.OrdinalIgnoreCase) >= 0
-            || combined.IndexOf("preview", StringComparison.OrdinalIgnoreCase) >= 0;
-    }
-
-    private static bool TryFormatValue(object value, out string formatted) {
-        formatted = null;
-        if (value == null) {
-            formatted = "null";
-            return true;
-        }
-
-        var type = value.GetType();
-        if (value is string || value is bool || value is char || type.IsEnum || type.IsPrimitive || type.IsValueType) {
-            try {
-                formatted = value.ToString();
-                return formatted != null && formatted.Length <= 220;
-            }
-            catch {
-                return false;
-            }
-        }
-
-        object stableId;
-        if (TryReadStableId(value, out stableId)) {
-            formatted = type.Name + "#" + (stableId ?? "null");
-            return true;
-        }
-        return false;
-    }
-
-    private static bool TryReadStableId(object value, out object id) {
-        id = null;
-        var type = value.GetType();
-        var names = new[] { "Id", "ID", "ProtoId", "PrototypeId", "m_id" };
-
-        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            foreach (var field in current.GetFields(
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
-                for (var i = 0; i < names.Length; i++) {
-                    if (!string.Equals(field.Name, names[i], StringComparison.Ordinal)) continue;
-                    try { id = field.GetValue(value); return true; }
-                    catch { return false; }
-                }
-            }
-        }
-
-        foreach (var property in type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
-            if (property.GetIndexParameters().Length != 0 || property.GetGetMethod(true) == null) continue;
-            for (var i = 0; i < names.Length; i++) {
-                if (!string.Equals(property.Name, names[i], StringComparison.Ordinal)) continue;
-                try { id = property.GetValue(value, null); return true; }
+            var property = current.GetProperty(
+                name,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (property != null && property.GetIndexParameters().Length == 0 && property.GetGetMethod(true) != null) {
+                try { value = property.GetValue(instance, null); return true; }
                 catch { return false; }
             }
         }
