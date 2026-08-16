@@ -1,19 +1,20 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Text;
 using Mafi;
 using Mafi.Core.Entities;
 
 namespace CoiCoop;
 
 /// <summary>
-/// Targeted sidecar synchronization for the sandbox ProductsSourceEntity.
+/// Targeted sidecar synchronization for sandbox product endpoints that mutate
+/// configuration outside InputScheduler.
 ///
-/// Runtime testing on COI 0.8.7 identified the selected source material as the
-/// compiler backing field <ProvidedProduct>k__BackingField. We intentionally do
-/// not perform broad reflection scans here: candidate entities are indexed only
-/// when the global entity count changes, and each candidate reads exactly one
-/// cached field.
+/// Runtime testing identified ProductsSourceEntity.ProvidedProduct as one such
+/// value. ProductsSinkEntity is handled by the same lightweight path: only
+/// configuration-like product selectors and IsEnabled are considered. Runtime
+/// counters such as ConsumedLastTick / ProvidedLastTick are deliberately ignored.
 /// </summary>
 internal sealed class SandboxSourceDiscovery {
     internal sealed class LocalUpdate {
@@ -26,34 +27,84 @@ internal sealed class SandboxSourceDiscovery {
         }
     }
 
-    private sealed class Candidate {
-        public IEntity Entity { get; }
-        public FieldInfo ProvidedProductField { get; }
-        public PropertyInfo ProvidedProductProperty { get; }
+    private sealed class SyncMember {
+        public string Key { get; }
+        public Type ValueType { get; }
+        public FieldInfo Field { get; }
+        public PropertyInfo Property { get; }
         public string LastComparable { get; set; }
         public bool HasBaseline { get; set; }
 
-        public Candidate(
-            IEntity entity,
-            FieldInfo providedProductField,
-            PropertyInfo providedProductProperty) {
+        public SyncMember(string key, Type valueType, FieldInfo field, PropertyInfo property) {
+            Key = key;
+            ValueType = valueType;
+            Field = field;
+            Property = property;
+        }
 
+        public bool TryRead(object target, out object value) {
+            value = null;
+            try {
+                var getter = Property?.GetGetMethod(true);
+                if (getter != null) {
+                    value = getter.Invoke(target, null);
+                    return true;
+                }
+                if (Field != null) {
+                    value = Field.GetValue(target);
+                    return true;
+                }
+            }
+            catch {
+            }
+            return false;
+        }
+
+        public bool TryWrite(object target, object value, out string error) {
+            error = null;
+            try {
+                var setter = Property?.GetSetMethod(true);
+                if (setter != null) {
+                    setter.Invoke(target, new[] { value });
+                    return true;
+                }
+                if (Field != null) {
+                    Field.SetValue(target, value);
+                    return true;
+                }
+                error = "member has no writable property or backing field";
+                return false;
+            }
+            catch (TargetInvocationException ex) {
+                var inner = ex.InnerException ?? ex;
+                error = inner.GetType().Name + ": " + inner.Message;
+                return false;
+            }
+            catch (Exception ex) {
+                error = ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
+        }
+    }
+
+    private sealed class Candidate {
+        public IEntity Entity { get; }
+        public Dictionary<string, SyncMember> Members { get; }
+
+        public Candidate(IEntity entity, Dictionary<string, SyncMember> members) {
             Entity = entity;
-            ProvidedProductField = providedProductField;
-            ProvidedProductProperty = providedProductProperty;
+            Members = members;
         }
     }
 
     private const string ProductsSourceTypeName = "Mafi.Base.Prototypes.Sandbox.ProductsSourceEntity";
-    private const string ProvidedProductBackingField = "<ProvidedProduct>k__BackingField";
-    private const string ProvidedProductPropertyName = "ProvidedProduct";
+    private const string ProductsSinkTypeName = "Mafi.Base.Prototypes.Sandbox.ProductsSinkEntity";
+    private const byte WireVersion = 1;
 
     private readonly DependencyResolver m_resolver;
     private readonly Dictionary<int, Candidate> m_candidates = new Dictionary<int, Candidate>();
-    private readonly Dictionary<Type, FieldInfo> m_fieldByType = new Dictionary<Type, FieldInfo>();
-    private readonly Dictionary<Type, PropertyInfo> m_propertyByType = new Dictionary<Type, PropertyInfo>();
-    private readonly HashSet<Type> m_typesWithoutField = new HashSet<Type>();
-    private readonly HashSet<Type> m_typesWithoutProperty = new HashSet<Type>();
+    private readonly Dictionary<Type, Dictionary<string, SyncMember>> m_memberTemplates
+        = new Dictionary<Type, Dictionary<string, SyncMember>>();
     private EntitiesManager m_entities;
     private int m_lastKnownEntityCount = -1;
 
@@ -75,13 +126,24 @@ internal sealed class SandboxSourceDiscovery {
             if (entity == null || m_candidates.ContainsKey(entity.Id.Value)) continue;
 
             var type = entity.GetType();
-            if (!IsProductsSourceType(type)) continue;
+            if (!IsSandboxEndpointType(type)) continue;
 
-            var field = GetProvidedProductField(type);
-            if (field == null) continue;
+            var template = GetMemberTemplate(type);
+            if (template.Count == 0) continue;
 
-            var property = GetProvidedProductProperty(type);
-            m_candidates.Add(entity.Id.Value, new Candidate(entity, field, property));
+            // Per-candidate state must not share LastComparable/HasBaseline with
+            // another entity, so clone the tiny member template.
+            var members = new Dictionary<string, SyncMember>(StringComparer.Ordinal);
+            foreach (var pair in template) {
+                var member = pair.Value;
+                members.Add(pair.Key, new SyncMember(
+                    member.Key,
+                    member.ValueType,
+                    member.Field,
+                    member.Property));
+            }
+
+            m_candidates.Add(entity.Id.Value, new Candidate(entity, members));
         }
 
         return before != m_candidates.Count;
@@ -102,41 +164,41 @@ internal sealed class SandboxSourceDiscovery {
         RefreshIfNeeded();
         if (m_candidates.Count == 0) return true;
 
-        foreach (var pair in m_candidates) {
-            var candidate = pair.Value;
-            object value;
-            try {
-                value = candidate.ProvidedProductField.GetValue(candidate.Entity);
+        foreach (var candidatePair in m_candidates) {
+            var candidate = candidatePair.Value;
+            foreach (var memberPair in candidate.Members) {
+                var member = memberPair.Value;
+                object value;
+                if (!member.TryRead(candidate.Entity, out value)) continue;
+
+                var comparable = SafeComparable(value);
+                if (!member.HasBaseline) {
+                    member.LastComparable = comparable;
+                    member.HasBaseline = true;
+                    continue;
+                }
+
+                if (string.Equals(member.LastComparable, comparable, StringComparison.Ordinal)) continue;
+
+                byte[] serializedValue;
+                string serializeError;
+                if (!codec.TrySerializeValue(
+                        value,
+                        member.ValueType,
+                        out serializedValue,
+                        out serializeError)) {
+
+                    error = "serialize sandbox endpoint " + candidatePair.Key
+                        + " member " + member.Key + " failed: " + serializeError;
+                    return false;
+                }
+
+                member.LastComparable = comparable;
+                if (updates == null) updates = new List<LocalUpdate>();
+                updates.Add(new LocalUpdate(
+                    candidatePair.Key,
+                    BuildMemberPayload(member.Key, serializedValue)));
             }
-            catch (Exception ex) {
-                error = "read source " + pair.Key + " failed: " + ex.GetType().Name + ": " + ex.Message;
-                return false;
-            }
-
-            var comparable = SafeComparable(value);
-            if (!candidate.HasBaseline) {
-                candidate.LastComparable = comparable;
-                candidate.HasBaseline = true;
-                continue;
-            }
-
-            if (string.Equals(candidate.LastComparable, comparable, StringComparison.Ordinal)) continue;
-
-            byte[] payload;
-            string serializeError;
-            if (!codec.TrySerializeValue(
-                    value,
-                    candidate.ProvidedProductField.FieldType,
-                    out payload,
-                    out serializeError)) {
-
-                error = "serialize source " + pair.Key + " failed: " + serializeError;
-                return false;
-            }
-
-            candidate.LastComparable = comparable;
-            if (updates == null) updates = new List<LocalUpdate>();
-            updates.Add(new LocalUpdate(pair.Key, payload));
         }
 
         return true;
@@ -154,7 +216,7 @@ internal sealed class SandboxSourceDiscovery {
             return false;
         }
         if (valuePayload == null) {
-            error = "remote source payload is null";
+            error = "remote sandbox payload is null";
             return false;
         }
 
@@ -165,44 +227,146 @@ internal sealed class SandboxSourceDiscovery {
             m_lastKnownEntityCount = -1;
             RefreshIfNeeded();
             if (!m_candidates.TryGetValue(entityId, out candidate)) {
-                error = "sandbox source entity " + entityId + " was not found";
+                error = "sandbox endpoint entity " + entityId + " was not found";
                 return false;
             }
+        }
+
+        string memberKey;
+        byte[] serializedValue;
+        if (!TryParseMemberPayload(valuePayload, out memberKey, out serializedValue)) {
+            error = "sandbox endpoint payload is malformed";
+            return false;
+        }
+
+        SyncMember member;
+        if (!candidate.Members.TryGetValue(memberKey, out member)) {
+            error = "sandbox endpoint " + entityId + " has no sync member " + memberKey;
+            return false;
         }
 
         object decoded;
         string deserializeError;
         if (!codec.TryDeserializeValue(
-                valuePayload,
-                candidate.ProvidedProductField.FieldType,
+                serializedValue,
+                member.ValueType,
                 out decoded,
                 out deserializeError)) {
 
-            error = "deserialize source " + entityId + " failed: " + deserializeError;
+            error = "deserialize sandbox endpoint " + entityId
+                + " member " + memberKey + " failed: " + deserializeError;
             return false;
         }
 
-        try {
-            var setter = candidate.ProvidedProductProperty?.GetSetMethod(true);
-            if (setter != null) {
-                setter.Invoke(candidate.Entity, new[] { decoded });
-            }
-            else {
-                candidate.ProvidedProductField.SetValue(candidate.Entity, decoded);
-            }
+        string writeError;
+        if (!member.TryWrite(candidate.Entity, decoded, out writeError)) {
+            error = "apply sandbox endpoint " + entityId
+                + " member " + memberKey + " failed: " + writeError;
+            return false;
+        }
 
-            candidate.LastComparable = SafeComparable(decoded);
-            candidate.HasBaseline = true;
-            return true;
+        member.LastComparable = SafeComparable(decoded);
+        member.HasBaseline = true;
+        return true;
+    }
+
+    private Dictionary<string, SyncMember> GetMemberTemplate(Type type) {
+        Dictionary<string, SyncMember> cached;
+        if (m_memberTemplates.TryGetValue(type, out cached)) return cached;
+
+        var result = new Dictionary<string, SyncMember>(StringComparer.Ordinal);
+        if (IsTypeOrBase(type, ProductsSourceTypeName)) {
+            AddExactMember(result, type, "ProvidedProduct");
+            AddExactMember(result, type, "IsEnabled");
         }
-        catch (TargetInvocationException ex) {
-            var inner = ex.InnerException ?? ex;
-            error = "apply source " + entityId + " failed: " + inner.GetType().Name + ": " + inner.Message;
-            return false;
+        else if (IsTypeOrBase(type, ProductsSinkTypeName)) {
+            // Different COI revisions have used slightly different names for
+            // product selectors. Register only configuration-looking members;
+            // never counters such as ConsumedLastTick.
+            var preferred = new[] {
+                "AcceptedProduct",
+                "ConsumedProduct",
+                "SelectedProduct",
+                "InputProduct",
+                "RequiredProduct",
+                "Product",
+                "IsEnabled"
+            };
+            for (var i = 0; i < preferred.Length; i++) {
+                AddExactMember(result, type, preferred[i]);
+            }
+            AddProductLikeSinkMembers(result, type);
         }
-        catch (Exception ex) {
-            error = "apply source " + entityId + " failed: " + ex.GetType().Name + ": " + ex.Message;
-            return false;
+
+        m_memberTemplates[type] = result;
+        return result;
+    }
+
+    private static void AddExactMember(
+        Dictionary<string, SyncMember> result,
+        Type type,
+        string propertyName) {
+
+        if (result.ContainsKey(propertyName)) return;
+
+        PropertyInfo property = null;
+        FieldInfo field = null;
+        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
+            if (property == null) {
+                property = current.GetProperty(
+                    propertyName,
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            }
+            if (field == null) {
+                field = current.GetField(
+                    "<" + propertyName + ">k__BackingField",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)
+                    ?? current.GetField(
+                        "m_" + char.ToLowerInvariant(propertyName[0]) + propertyName.Substring(1),
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            }
+        }
+
+        var valueType = property?.PropertyType ?? field?.FieldType;
+        if (valueType == null) return;
+        if (property?.GetGetMethod(true) == null && field == null) return;
+        if (property?.GetSetMethod(true) == null && field == null) return;
+
+        result.Add(propertyName, new SyncMember(propertyName, valueType, field, property));
+    }
+
+    private static void AddProductLikeSinkMembers(
+        Dictionary<string, SyncMember> result,
+        Type type) {
+
+        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
+            foreach (var field in current.GetFields(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
+
+                if (field.IsStatic) continue;
+                var name = field.Name ?? string.Empty;
+                var combined = name + " " + (field.FieldType?.FullName ?? string.Empty);
+                if (combined.IndexOf("product", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (name.IndexOf("LastTick", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("counter", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("port", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("proto", StringComparison.OrdinalIgnoreCase) >= 0) {
+                    continue;
+                }
+
+                var configLike = name.IndexOf("selected", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("accepted", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("consumed", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("input", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("required", StringComparison.OrdinalIgnoreCase) >= 0
+                    || string.Equals(name, "m_product", StringComparison.OrdinalIgnoreCase);
+                if (!configLike) continue;
+
+                var key = "field:" + name;
+                if (!result.ContainsKey(key)) {
+                    result.Add(key, new SyncMember(key, field.FieldType, field, null));
+                }
+            }
         }
     }
 
@@ -217,56 +381,54 @@ internal sealed class SandboxSourceDiscovery {
         return true;
     }
 
-    private FieldInfo GetProvidedProductField(Type type) {
-        FieldInfo cached;
-        if (m_fieldByType.TryGetValue(type, out cached)) return cached;
-        if (m_typesWithoutField.Contains(type)) return null;
-
-        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            var field = current.GetField(
-                ProvidedProductBackingField,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
-            if (field == null || field.IsStatic) continue;
-
-            m_fieldByType[type] = field;
-            return field;
-        }
-
-        m_typesWithoutField.Add(type);
-        return null;
+    private static bool IsSandboxEndpointType(Type type) {
+        return IsTypeOrBase(type, ProductsSourceTypeName)
+            || IsTypeOrBase(type, ProductsSinkTypeName);
     }
 
-    private PropertyInfo GetProvidedProductProperty(Type type) {
-        PropertyInfo cached;
-        if (m_propertyByType.TryGetValue(type, out cached)) return cached;
-        if (m_typesWithoutProperty.Contains(type)) return null;
-
-        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            foreach (var property in current.GetProperties(
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)) {
-
-                if (!string.Equals(property.Name, ProvidedProductPropertyName, StringComparison.Ordinal)
-                    || property.GetIndexParameters().Length != 0) {
-                    continue;
-                }
-
-                m_propertyByType[type] = property;
-                return property;
-            }
-        }
-
-        m_typesWithoutProperty.Add(type);
-        return null;
-    }
-
-    private static bool IsProductsSourceType(Type type) {
+    private static bool IsTypeOrBase(Type type, string fullName) {
         if (type == null) return false;
         for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
-            if (string.Equals(current.FullName, ProductsSourceTypeName, StringComparison.Ordinal)) {
-                return true;
-            }
+            if (string.Equals(current.FullName, fullName, StringComparison.Ordinal)) return true;
         }
         return false;
+    }
+
+    private static byte[] BuildMemberPayload(string memberKey, byte[] serializedValue) {
+        memberKey = memberKey ?? string.Empty;
+        serializedValue = serializedValue ?? Array.Empty<byte>();
+        var keyBytes = Encoding.UTF8.GetBytes(memberKey);
+        if (keyBytes.Length > ushort.MaxValue) throw new InvalidOperationException("sandbox member key is too long");
+
+        var payload = new byte[1 + 2 + keyBytes.Length + serializedValue.Length];
+        payload[0] = WireVersion;
+        payload[1] = (byte)(keyBytes.Length & 0xFF);
+        payload[2] = (byte)((keyBytes.Length >> 8) & 0xFF);
+        Buffer.BlockCopy(keyBytes, 0, payload, 3, keyBytes.Length);
+        if (serializedValue.Length > 0) {
+            Buffer.BlockCopy(serializedValue, 0, payload, 3 + keyBytes.Length, serializedValue.Length);
+        }
+        return payload;
+    }
+
+    private static bool TryParseMemberPayload(
+        byte[] payload,
+        out string memberKey,
+        out byte[] serializedValue) {
+
+        memberKey = null;
+        serializedValue = null;
+        if (payload == null || payload.Length < 3 || payload[0] != WireVersion) return false;
+
+        var keyLength = payload[1] | (payload[2] << 8);
+        if (keyLength <= 0 || payload.Length < 3 + keyLength) return false;
+
+        memberKey = Encoding.UTF8.GetString(payload, 3, keyLength);
+        serializedValue = new byte[payload.Length - 3 - keyLength];
+        if (serializedValue.Length > 0) {
+            Buffer.BlockCopy(payload, 3 + keyLength, serializedValue, 0, serializedValue.Length);
+        }
+        return true;
     }
 
     private static string SafeComparable(object value) {
