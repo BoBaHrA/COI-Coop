@@ -78,6 +78,14 @@ try {
             Write-Host "Expires: $expiresAt"
         }
         Write-Host ""
+        Write-Host "IMPORTANT for the current deterministic prototype:" -ForegroundColor Yellow
+        Write-Host "1. Your friend starts the Internet client with this code."
+        Write-Host "2. Your friend loads COOP_LAN_BASE_CLIENT and waits in the world."
+        Write-Host "3. Only then press ENTER here to start the HOST game." -ForegroundColor Green
+        Write-Host ""
+        [void](Read-Host "Press ENTER after the client save is loaded")
+        Write-Host "Starting host Captain of Industry..."
+        Write-Host ""
     }
     else {
         if ([string]::IsNullOrWhiteSpace($SessionCode)) {
