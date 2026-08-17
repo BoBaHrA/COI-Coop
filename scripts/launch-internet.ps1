@@ -46,71 +46,80 @@ function To-WebSocketUrl([string]$BaseUrl) {
     return "${scheme}://$($uri.Authority)/relay"
 }
 
-$baseUrl = Normalize-RelayBase $RelayUrl
-$wsUrl = To-WebSocketUrl $baseUrl
-$token = $null
-$code = $null
-$expiresAt = $null
+try {
+    $baseUrl = Normalize-RelayBase $RelayUrl
+    $wsUrl = To-WebSocketUrl $baseUrl
+    $token = $null
+    $code = $null
+    $expiresAt = $null
 
-Write-Host "=== COI-Coop INTERNET $Mode ==="
-Write-Host "Relay: $baseUrl"
-Write-Host ""
+    Write-Host "=== COI-Coop INTERNET $Mode ==="
+    Write-Host "Relay: $baseUrl"
+    Write-Host ""
 
-if ($Mode -eq "Host") {
-    Write-Host "Creating co-op session..."
-    $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session" -ContentType "application/json" -Body "{}" -TimeoutSec 60
+    if ($Mode -eq "Host") {
+        Write-Host "Creating co-op session..."
+        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session" -ContentType "application/json" -Body "{}" -TimeoutSec 60
 
-    $code = Normalize-SessionCode ([string]$response.code)
-    $token = [string]$response.hostToken
-    $expiresAt = [string]$response.expiresAt
+        $code = Normalize-SessionCode ([string]$response.code)
+        $token = [string]$response.hostToken
+        $expiresAt = [string]$response.expiresAt
 
-    if ([string]::IsNullOrWhiteSpace($code) -or [string]::IsNullOrWhiteSpace($token)) {
-        throw "Relay returned an invalid host session response."
+        if ([string]::IsNullOrWhiteSpace($code) -or [string]::IsNullOrWhiteSpace($token)) {
+            throw "Relay returned an invalid host session response."
+        }
+
+        Write-Host ""
+        Write-Host "=========================================" -ForegroundColor Cyan
+        Write-Host "  SESSION CODE:  $code" -ForegroundColor Green
+        Write-Host "=========================================" -ForegroundColor Cyan
+        Write-Host "Send ONLY this code to your friend." -ForegroundColor Yellow
+        if (-not [string]::IsNullOrWhiteSpace($expiresAt)) {
+            Write-Host "Expires: $expiresAt"
+        }
+        Write-Host ""
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($SessionCode)) {
+            $SessionCode = Read-Host "Session code"
+        }
+        $code = Normalize-SessionCode $SessionCode
+        if ([string]::IsNullOrWhiteSpace($code)) {
+            throw "Session code must contain exactly 8 letters/digits (for example ABCD-2345)."
+        }
+
+        Write-Host "Joining session $code..."
+        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session/$code/join" -ContentType "application/json" -Body "{}" -TimeoutSec 60
+
+        $token = [string]$response.clientToken
+        $expiresAt = [string]$response.expiresAt
+        if ([string]::IsNullOrWhiteSpace($token)) {
+            throw "Relay returned an invalid client session response."
+        }
+
+        Write-Host "Session accepted." -ForegroundColor Green
+        if (-not [string]::IsNullOrWhiteSpace($expiresAt)) {
+            Write-Host "Expires: $expiresAt"
+        }
+        Write-Host ""
     }
 
-    Write-Host ""
-    Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "  SESSION CODE:  $code" -ForegroundColor Green
-    Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "Send ONLY this code to your friend." -ForegroundColor Yellow
-    if (-not [string]::IsNullOrWhiteSpace($expiresAt)) {
-        Write-Host "Expires: $expiresAt"
-    }
-    Write-Host ""
+    # These values exist only in this launcher process and the Captain of Industry
+    # child process. Session tokens are never persisted to disk.
+    $env:COI_COOP_LAN = "0"
+    $env:COI_COOP_RELAY = "1"
+    $env:COI_COOP_RELAY_WS = $wsUrl
+    $env:COI_COOP_SESSION_CODE = $code
+    $env:COI_COOP_SESSION_TOKEN = $token
+
+    $launcher = Join-Path $PSScriptRoot "launch-coop.ps1"
+    & $launcher -Mode $Mode -CoiRoot $CoiRoot -Port $Port -Replay
+    exit 0
 }
-else {
-    if ([string]::IsNullOrWhiteSpace($SessionCode)) {
-        $SessionCode = Read-Host "Session code"
-    }
-    $code = Normalize-SessionCode $SessionCode
-    if ([string]::IsNullOrWhiteSpace($code)) {
-        throw "Session code must contain exactly 8 letters/digits (for example ABCD-2345)."
-    }
-
-    Write-Host "Joining session $code..."
-    $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session/$code/join" -ContentType "application/json" -Body "{}" -TimeoutSec 60
-
-    $token = [string]$response.clientToken
-    $expiresAt = [string]$response.expiresAt
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        throw "Relay returned an invalid client session response."
-    }
-
-    Write-Host "Session accepted." -ForegroundColor Green
-    if (-not [string]::IsNullOrWhiteSpace($expiresAt)) {
-        Write-Host "Expires: $expiresAt"
-    }
+catch {
     Write-Host ""
+    Write-Host "COI-Coop internet launcher failed:" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host ""
+    exit 1
 }
-
-# These values exist only in this launcher process and the Captain of Industry
-# child process. Session tokens are never persisted to disk.
-$env:COI_COOP_LAN = "0"
-$env:COI_COOP_RELAY = "1"
-$env:COI_COOP_RELAY_WS = $wsUrl
-$env:COI_COOP_SESSION_CODE = $code
-$env:COI_COOP_SESSION_TOKEN = $token
-
-$launcher = Join-Path $PSScriptRoot "launch-coop.ps1"
-& $launcher -Mode $Mode -CoiRoot $CoiRoot -Port $Port -Replay
-exit 0
