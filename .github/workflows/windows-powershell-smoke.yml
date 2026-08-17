@@ -1,0 +1,33 @@
+name: Windows PowerShell smoke test
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**/*.ps1'
+      - '.github/workflows/windows-powershell-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  parse-scripts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse all PowerShell scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem -Path scripts -Filter *.ps1 -Recurse | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "Syntax errors in $($_.FullName):" -ForegroundColor Red
+              $errors | ForEach-Object { Write-Host "  $($_.Message)" -ForegroundColor Red }
+            }
+            else {
+              Write-Host "OK $($_.Name)"
+            }
+          }
+          if ($failed) { throw 'One or more PowerShell scripts failed Windows PowerShell 5.1 parsing.' }
