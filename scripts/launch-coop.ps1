@@ -21,11 +21,21 @@ function Test-CoiRoot([string]$Path) {
     return (Test-Path $mafi) -and (Test-Path $exe)
 }
 
+function Add-UniquePath($List, [string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try {
+        if ((Test-Path -LiteralPath $Path) -and -not $List.Contains($Path)) {
+            $List.Add($Path)
+        }
+    } catch { }
+}
+
 function Get-SteamRoots {
     $roots = New-Object System.Collections.Generic.List[string]
 
     $registryCandidates = @(
         @{ Key = "HKEY_CURRENT_USER\Software\Valve\Steam"; Name = "SteamPath" },
+        @{ Key = "HKEY_CURRENT_USER\Software\Valve\Steam"; Name = "SteamExe" },
         @{ Key = "HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Valve\Steam"; Name = "InstallPath" },
         @{ Key = "HKEY_LOCAL_MACHINE\SOFTWARE\Valve\Steam"; Name = "InstallPath" }
     )
@@ -33,24 +43,27 @@ function Get-SteamRoots {
     foreach ($candidate in $registryCandidates) {
         try {
             $value = [Microsoft.Win32.Registry]::GetValue($candidate.Key, $candidate.Name, $null)
-            if ($value -and (Test-Path $value) -and -not $roots.Contains($value)) {
-                $roots.Add($value)
+            if ($value) {
+                $text = [string]$value
+                if ($text.EndsWith("steam.exe", [StringComparison]::OrdinalIgnoreCase)) {
+                    $text = Split-Path -Parent $text
+                }
+                Add-UniquePath $roots $text
             }
         } catch { }
     }
 
-    $commonCandidates = @()
-    if (${env:ProgramFiles(x86)}) {
-        $commonCandidates += (Join-Path ${env:ProgramFiles(x86)} "Steam")
-    }
-    if ($env:ProgramFiles) {
-        $commonCandidates += (Join-Path $env:ProgramFiles "Steam")
-    }
+    if (${env:ProgramFiles(x86)}) { Add-UniquePath $roots (Join-Path ${env:ProgramFiles(x86)} "Steam") }
+    if ($env:ProgramFiles) { Add-UniquePath $roots (Join-Path $env:ProgramFiles "Steam") }
 
-    foreach ($path in $commonCandidates) {
-        if ((Test-Path $path) -and -not $roots.Contains($path)) {
-            $roots.Add($path)
-        }
+    # Portable/custom Steam installs are common on gaming PCs. Probe only cheap,
+    # conventional roots on each local filesystem drive; never recursively scan.
+    foreach ($drive in Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue) {
+        if (-not $drive.Root) { continue }
+        Add-UniquePath $roots (Join-Path $drive.Root "Steam")
+        Add-UniquePath $roots (Join-Path $drive.Root "SteamLibrary")
+        Add-UniquePath $roots (Join-Path $drive.Root "Games\Steam")
+        Add-UniquePath $roots (Join-Path $drive.Root "Games\SteamLibrary")
     }
 
     return $roots
@@ -90,7 +103,22 @@ if (-not (Test-CoiRoot $CoiRoot)) {
 }
 
 if (-not (Test-CoiRoot $CoiRoot)) {
-    throw "Captain of Industry was not found automatically. Re-run with -CoiRoot 'C:\path\to\Captain of Industry'."
+    Write-Host ""
+    Write-Host "Captain of Industry was not found automatically." -ForegroundColor Yellow
+    Write-Host "In Steam: Captain of Industry -> Properties -> Installed Files -> Browse." -ForegroundColor Yellow
+    Write-Host "Copy the folder path that contains 'Captain of Industry.exe'." -ForegroundColor Yellow
+    Write-Host ""
+    $manualRoot = Read-Host "Captain of Industry folder (leave empty to cancel)"
+    if (-not [string]::IsNullOrWhiteSpace($manualRoot)) {
+        $manualRoot = $manualRoot.Trim().Trim('"')
+        if (Test-CoiRoot $manualRoot) {
+            $CoiRoot = $manualRoot
+        }
+    }
+}
+
+if (-not (Test-CoiRoot $CoiRoot)) {
+    throw "Captain of Industry was not found. The selected folder must contain 'Captain of Industry.exe' and 'Captain of Industry_Data\Managed\Mafi.dll'."
 }
 
 $resolvedRoot = (Resolve-Path $CoiRoot).Path
@@ -114,5 +142,9 @@ if ($Replay) {
 Write-Host ""
 
 $process = Start-Process -FilePath $exe -WorkingDirectory $resolvedRoot -PassThru
-Write-Host "Started Captain of Industry PID $($process.Id) as $Mode."
+Start-Sleep -Milliseconds 750
+if ($process.HasExited) {
+    throw "Captain of Industry process exited immediately with code $($process.ExitCode)."
+}
+Write-Host "Started Captain of Industry PID $($process.Id) as $Mode." -ForegroundColor Green
 Write-Host "This launcher can now be closed; the game inherited the co-op environment."
