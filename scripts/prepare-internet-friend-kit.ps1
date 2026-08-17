@@ -101,10 +101,10 @@ set "SAVEROOT=%APPDATA%\Captain of Industry\Saves"
 if not exist "%MODDST%" mkdir "%MODDST%"
 if not exist "%SAVEROOT%" mkdir "%SAVEROOT%"
 
-copy /Y "payload\CoiCoop\CoiCoop.dll" "%MODDST%\CoiCoop.dll" >nul || goto :fail
-copy /Y "payload\CoiCoop\manifest.json" "%MODDST%\manifest.json" >nul || goto :fail
-copy /Y "payload\CoiCoop\config.json" "%MODDST%\config.json" >nul || goto :fail
-xcopy "payload\Saves\*" "%SAVEROOT%\" /E /I /Y >nul || goto :fail
+copy /Y "payload\CoiCoop\CoiCoop.dll" "%MODDST%\CoiCoop.dll" >nul || goto :installfail
+copy /Y "payload\CoiCoop\manifest.json" "%MODDST%\manifest.json" >nul || goto :installfail
+copy /Y "payload\CoiCoop\config.json" "%MODDST%\config.json" >nul || goto :installfail
+xcopy "payload\Saves\*" "%SAVEROOT%\" /E /I /Y >nul || goto :installfail
 
 echo Mod installed to: %MODDST%
 echo Save payload copied under: %SAVEROOT%
@@ -113,11 +113,29 @@ echo.
 echo Enter the SESSION CODE received from the host.
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\launch-internet.ps1" -Mode Client -RelayUrl "$relayBase"
-exit /b %ERRORLEVEL%
+set "LAUNCHCODE=%ERRORLEVEL%"
+if not "%LAUNCHCODE%"=="0" goto :launchfail
 
-:fail
 echo.
-echo INSTALL FAILED.
+echo Captain of Industry launch command completed successfully.
+timeout /t 2 /nobreak >nul
+exit /b 0
+
+:launchfail
+echo.
+echo ============================================================
+echo COI-COOP CLIENT LAUNCH FAILED with exit code %LAUNCHCODE%.
+echo Keep this window open and send a screenshot of everything above.
+echo ============================================================
+echo.
+pause
+exit /b %LAUNCHCODE%
+
+:installfail
+echo.
+echo INSTALL FAILED while copying mod/save files.
+echo Keep this window open and send a screenshot of everything above.
+echo.
 pause
 exit /b 1
 "@
@@ -130,8 +148,9 @@ COI-Coop internet client test kit
 2. Make sure Captain of Industry is closed.
 3. Run INSTALL_AND_LAUNCH.bat.
 4. Enter the session code sent by the host.
-5. In Captain of Industry, enable 'COI Co-op Prototype' if needed.
-6. Load '$($clientSave.BaseName)'.
+5. If the launcher cannot find Captain of Industry automatically, use Steam -> Captain of Industry -> Properties -> Installed Files -> Browse and paste that folder path.
+6. In Captain of Industry, enable 'COI Co-op Prototype' if needed.
+7. Load '$($clientSave.BaseName)'.
 
 Relay:
 $relayBase
