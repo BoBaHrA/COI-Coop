@@ -34,6 +34,45 @@ function Normalize-SessionCode([string]$Value) {
     return $raw.Substring(0, 4) + "-" + $raw.Substring(4, 4)
 }
 
+function Resolve-PreparedHostSave([string]$Value) {
+    $saveRoot = Join-Path $env:APPDATA "Captain of Industry\Saves"
+    if (-not (Test-Path -LiteralPath $saveRoot -PathType Container)) {
+        throw "Captain of Industry save directory was not found: $saveRoot"
+    }
+
+    $allSaves = @(Get-ChildItem -LiteralPath $saveRoot -File -Recurse -Filter "*.save" | Sort-Object LastWriteTime -Descending)
+    $source = $null
+
+    if (Test-Path -LiteralPath $Value -PathType Leaf) {
+        $source = Get-Item -LiteralPath $Value
+    }
+    else {
+        $leaf = $Value
+        if (-not $leaf.EndsWith(".save", [StringComparison]::OrdinalIgnoreCase)) { $leaf += ".save" }
+        $exact = @($allSaves | Where-Object { [string]::Equals($_.Name, $leaf, [StringComparison]::OrdinalIgnoreCase) })
+        if ($exact.Count -eq 1) {
+            $source = $exact[0]
+        }
+        elseif ($exact.Count -gt 1) {
+            throw "More than one source save named '$leaf' exists; pass an exact .save path."
+        }
+        else {
+            $needle = [IO.Path]::GetFileNameWithoutExtension($Value)
+            $partial = @($allSaves | Where-Object { $_.BaseName.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_.BaseName -notlike "*_HOST" -and $_.BaseName -notlike "*_CLIENT" })
+            if ($partial.Count -ne 1) {
+                throw "Could not resolve the prepared host baseline for '$Value'. Pass an exact source .save path."
+            }
+            $source = $partial[0]
+        }
+    }
+
+    $hostPath = Join-Path $source.DirectoryName ($source.BaseName + "_HOST.save")
+    if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
+        throw "Prepared HOST save was not found after split-save preparation: $hostPath"
+    }
+    return (Resolve-Path -LiteralPath $hostPath).Path
+}
+
 function Get-CoiProcesses {
     return @(
         Get-Process -ErrorAction SilentlyContinue |
@@ -71,9 +110,6 @@ function Force-KillSingleProcess([int]$ProcessId) {
     $stdoutPath = Join-Path $env:TEMP ("coi-coop-taskkill-{0}-{1}.out" -f $ProcessId, [Guid]::NewGuid().ToString("N"))
     $stderrPath = Join-Path $env:TEMP ("coi-coop-taskkill-{0}-{1}.err" -f $ProcessId, [Guid]::NewGuid().ToString("N"))
     try {
-        # Do NOT use /T here. Captain of Industry may itself be a child of Steam or
-        # another launcher process. We only want to terminate this exact stale COI
-        # process, never its parent or unrelated siblings/children.
         $killer = Start-Process -FilePath "taskkill.exe" -ArgumentList @("/PID", [string]$ProcessId, "/F") -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
         $stdout = if (Test-Path $stdoutPath) { (Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) } else { "" }
         $stderr = if (Test-Path $stderrPath) { (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue) } else { "" }
@@ -176,6 +212,10 @@ try {
     Write-Host "Refreshing disposable test saves from '$SourceSaveName'..."
     & (Join-Path $PSScriptRoot "prepare-replay-saves.ps1") -SourceSaveName $SourceSaveName
 
+    $preparedHostSave = Resolve-PreparedHostSave $SourceSaveName
+    $baselineSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $preparedHostSave).Hash.ToUpperInvariant()
+    Write-Host "Protocol-v5 baseline: $baselineSha256" -ForegroundColor Green
+
     $project = Join-Path $repoRoot "tools\CoiCoop.TestPeer\CoiCoop.TestPeer.csproj"
     Write-Host ""
     Write-Host "Building headless test peer..."
@@ -214,6 +254,7 @@ try {
     $env:COI_COOP_SESSION_CODE = $code
     $env:COI_COOP_SESSION_TOKEN = $clientToken
     $env:COI_COOP_TEST_PEER_ROLE = "client"
+    $env:COI_COOP_BASELINE_SHA256 = $baselineSha256
 
     $botProcess = Start-Process -FilePath "dotnet" -ArgumentList ('"' + $botDll + '"') -RedirectStandardOutput $botLog -RedirectStandardError $botErr -PassThru
     Set-Content -LiteralPath $oldPidPath -Value ([string]$botProcess.Id) -Encoding ASCII
@@ -233,6 +274,7 @@ try {
     $env:COI_COOP_RELAY_WS = $wsUrl
     $env:COI_COOP_SESSION_CODE = $code
     $env:COI_COOP_SESSION_TOKEN = $hostToken
+    $env:COI_COOP_BASELINE_SHA256 = $baselineSha256
     Remove-Item Env:COI_COOP_TEST_PEER_ROLE -ErrorAction SilentlyContinue
 
     Write-Host "Launching the ONLY real Captain of Industry process as HOST..." -ForegroundColor Cyan
@@ -240,7 +282,8 @@ try {
 
     Write-Host ""
     Write-Host "HOST + BOT TEST READY" -ForegroundColor Green
-    Write-Host "Load: ${SourceSaveName}_HOST" -ForegroundColor Yellow
+    Write-Host "Load: $([IO.Path]::GetFileNameWithoutExtension($preparedHostSave))" -ForegroundColor Yellow
+    Write-Host "Baseline: $baselineSha256" -ForegroundColor Green
     Write-Host ""
     Write-Host "This harness tests gameplay command capture/serialization/authority/replay through the REAL Render relay."
     Write-Host "It does not validate a second simulation or remote placement rendering."
