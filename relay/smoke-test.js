@@ -1,7 +1,6 @@
 'use strict';
 
 const { spawn } = require('child_process');
-const path = require('path');
 const { WebSocket } = require('ws');
 
 const port = 18000 + Math.floor(Math.random() * 1000);
@@ -43,7 +42,7 @@ function openSocket(code, role, lane, token) {
     const ws = new WebSocket(url, {
       headers: { Authorization: `Bearer ${token}` }
     });
-    const timer = setTimeout(() => reject(new Error(`${role} websocket open timeout`)), 5000);
+    const timer = setTimeout(() => reject(new Error(`${role} lane=${lane} websocket open timeout`)), 5000);
     ws.once('open', () => {
       clearTimeout(timer);
       resolve(ws);
@@ -90,6 +89,29 @@ function waitForBinary(ws, expected) {
   });
 }
 
+async function expectJoinResyncRequired(code) {
+  const response = await fetch(`${baseUrl}/api/session/${encodeURIComponent(code)}/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}'
+  });
+  const body = await response.json();
+  if (response.status !== 409 || body.error !== 'resync_required') {
+    throw new Error(`expected resync_required join rejection, got ${response.status}: ${JSON.stringify(body)}`);
+  }
+}
+
+async function expectGameplayReconnectRejected(code, token) {
+  let rejected = false;
+  try {
+    const socket = await openSocket(code, 'client', 0, token);
+    try { socket.terminate(); } catch { }
+  } catch (error) {
+    rejected = /409/.test(String(error && error.message ? error.message : error));
+  }
+  if (!rejected) throw new Error('gameplay reconnect was not rejected with HTTP 409');
+}
+
 async function main() {
   const server = spawn(process.execPath, ['server.js'], {
     cwd: __dirname,
@@ -106,6 +128,9 @@ async function main() {
 
   let host;
   let client;
+  let previewHost;
+  let previewClient;
+  let previewClient2;
   try {
     await waitForHealth();
 
@@ -129,10 +154,29 @@ async function main() {
     client.send(clientPayload, { binary: true });
     await hostReceived;
 
-    console.log('RELAY SMOKE PASS - session creation, authenticated WSS pairing, and binary relay work both ways');
+    // Sidecar lanes are allowed to recover independently because they do not own
+    // authoritative simulation state.
+    previewHost = await openSocket(created.code, 'host', 1, created.hostToken);
+    previewClient = await openSocket(created.code, 'client', 1, joined.clientToken);
+    previewClient.terminate();
+    previewClient = null;
+    await delay(150);
+    previewClient2 = await openSocket(created.code, 'client', 1, joined.clientToken);
+
+    // Gameplay is deliberately fail-closed until snapshot/catch-up exists.
+    client.terminate();
+    client = null;
+    await delay(200);
+    await expectJoinResyncRequired(created.code);
+    await expectGameplayReconnectRejected(created.code, joined.clientToken);
+
+    console.log('RELAY SMOKE PASS - binary relay works, sidecars reconnect, gameplay reconnect requires resync');
   } finally {
     try { host?.terminate(); } catch { }
     try { client?.terminate(); } catch { }
+    try { previewHost?.terminate(); } catch { }
+    try { previewClient?.terminate(); } catch { }
+    try { previewClient2?.terminate(); } catch { }
     try { server.kill('SIGTERM'); } catch { }
     await delay(200);
     if (!server.killed) {
