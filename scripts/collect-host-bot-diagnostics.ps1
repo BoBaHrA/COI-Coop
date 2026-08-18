@@ -31,6 +31,10 @@ function Count-Matches([string[]]$InputLines, [string]$Needle) {
     return @($InputLines | Where-Object { $_ -like ("*" + $Needle + "*") }).Count
 }
 
+function Count-RegexMatches([string[]]$InputLines, [string]$Pattern) {
+    return @($InputLines | Where-Object { $_ -match $Pattern }).Count
+}
+
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $outPath = Join-Path $artifactDir ("host-bot-diagnostics-" + $stamp + ".txt")
 $lines = New-Object System.Collections.Generic.List[string]
@@ -43,9 +47,13 @@ $lines.Add("Gameplay WELCOME: " + (Count-Matches $botLines "gameplay WELCOME acc
 $lines.Add("Preview  WELCOME: " + (Count-Matches $botLines "preview preview WELCOME accepted"))
 $lines.Add("Path     WELCOME: " + (Count-Matches $botLines "path preview WELCOME accepted"))
 $lines.Add("Blueprint WELCOME: " + (Count-Matches $botLines "blueprint preview WELCOME accepted"))
-$lines.Add("Preview packets lane1: " + (Count-Matches $botLines "TEST-PEER preview PREVIEW"))
-$lines.Add("Preview packets lane2: " + (Count-Matches $botLines "TEST-PEER path PREVIEW"))
-$lines.Add("Preview packets lane3: " + (Count-Matches $botLines "TEST-PEER blueprint PREVIEW"))
+$lines.Add("Preview payload log samples lane1: " + (Count-RegexMatches $botLines '^TEST-PEER preview PREVIEW rev='))
+$lines.Add("Path payload log samples lane2: " + (Count-RegexMatches $botLines '^TEST-PEER path PREVIEW rev='))
+$lines.Add("Blueprint payload log samples lane3: " + (Count-RegexMatches $botLines '^TEST-PEER blueprint PREVIEW rev='))
+$lines.Add("Game placement TX starts: " + (Count-Matches $gameCoop "PREVIEW GHOST TX START"))
+$lines.Add("Game placement-multi TX starts: " + (Count-Matches $gameCoop "PREVIEW MULTI GHOST TX START"))
+$lines.Add("Game path TX starts: " + (Count-Matches $gameCoop "PATH GHOST TX START"))
+$lines.Add("Game blueprint TX starts: " + (Count-Matches $gameCoop "BLUEPRINT GHOST TX START"))
 $lines.Add("Relay disconnects: " + (Count-Matches $gameCoop "relay disconnected"))
 $lines.Add("REPLAY HALT: " + (Count-Matches $gameCoop "REPLAY HALT"))
 $lines.Add("FRAME BLOCKED: " + (Count-Matches $gameCoop "FRAME BLOCKED"))
