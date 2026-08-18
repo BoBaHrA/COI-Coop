@@ -4,12 +4,22 @@ using System.Globalization;
 namespace CoiCoop.Networking;
 
 internal static class NetworkProtocol {
-    public const int ProtocolVersion = 4;
+    public const int ProtocolVersion = 5;
     public const string ModVersion = "0.0.1";
 
     public static string Hello() => $"HELLO|{ProtocolVersion}|{ModVersion}";
     public static string Welcome() => $"WELCOME|{ProtocolVersion}|{ModVersion}";
-    public static string Ready() => "READY";
+
+    public static string Ready(string baselineId) {
+        if (string.IsNullOrWhiteSpace(baselineId)) {
+            throw new ArgumentException("Baseline id is required.", nameof(baselineId));
+        }
+        if (baselineId.IndexOf('|') >= 0) {
+            throw new ArgumentException("Baseline id may not contain '|'.", nameof(baselineId));
+        }
+        return "READY|" + baselineId;
+    }
+
     public static string Ping(long nonce) => $"PING|{nonce}";
     public static string Pong(long nonce) => $"PONG|{nonce}";
     public static string Frame(long authorityFrame) => $"FRAME|{authorityFrame}";
@@ -83,8 +93,17 @@ internal static class NetworkProtocol {
             && string.Equals(parts[2], ModVersion, StringComparison.Ordinal);
     }
 
-    public static bool IsReady(string line)
-        => string.Equals(line, "READY", StringComparison.Ordinal);
+    public static bool TryReadReady(string line, out string baselineId) {
+        baselineId = null;
+        if (!TrySplit(line, "READY", out var parts)
+            || parts.Length != 2
+            || string.IsNullOrWhiteSpace(parts[1])) {
+            return false;
+        }
+
+        baselineId = parts[1].Trim();
+        return baselineId.IndexOf('|') < 0;
+    }
 
     public static bool TryReadPing(string line, out long nonce) => TryReadNonce(line, "PING", out nonce);
     public static bool TryReadPong(string line, out long nonce) => TryReadNonce(line, "PONG", out nonce);
