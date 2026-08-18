@@ -113,13 +113,15 @@ function Publish-SessionSnapshot(
         -TimeoutSec 120
 
     $meta = $web.Content | ConvertFrom-Json
-    if ($null -eq $meta
-        -or [string]::IsNullOrWhiteSpace([string]$meta.sha256)
-        -or -not [string]::Equals([string]$meta.sha256, $hash, [StringComparison]::OrdinalIgnoreCase)) {
+    $metaHash = ""
+    if ($null -ne $meta) {
+        $metaHash = [string]($meta.sha256)
+    }
+    if ($null -eq $meta -or [string]::IsNullOrWhiteSpace($metaHash) -or -not [string]::Equals($metaHash, $hash, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Relay snapshot hash did not match the local host save."
     }
 
-    Write-Host ("Snapshot: {0} bytes" -f [string]$meta.size)
+    Write-Host ("Snapshot: {0} bytes" -f [string]($meta.size))
     Write-Host "SHA256:   $hash" -ForegroundColor Green
     return $meta
 }
@@ -149,14 +151,18 @@ function Download-SessionSnapshot(
     [string]$ClientToken,
     $SnapshotMeta) {
 
-    if ($null -eq $SnapshotMeta
-        -or [string]::IsNullOrWhiteSpace([string]$SnapshotMeta.sha256)
-        -or [string]::IsNullOrWhiteSpace([string]$SnapshotMeta.name)) {
+    if ($null -eq $SnapshotMeta) {
         throw "This session has no synchronized host snapshot. Ask the host to use the current Internet launcher."
     }
 
-    $expectedHash = ([string]$SnapshotMeta.sha256).ToUpperInvariant()
-    $baseName = Get-ClientSaveBaseName ([string]$SnapshotMeta.name)
+    $metaHash = [string]($SnapshotMeta.sha256)
+    $metaName = [string]($SnapshotMeta.name)
+    if ([string]::IsNullOrWhiteSpace($metaHash) -or [string]::IsNullOrWhiteSpace($metaName)) {
+        throw "This session has invalid snapshot metadata. Ask the host to create a new session."
+    }
+
+    $expectedHash = $metaHash.ToUpperInvariant()
+    $baseName = Get-ClientSaveBaseName $metaName
     $clientLeaf = $baseName + "_CLIENT.save"
     $saveRoot = Join-Path $env:APPDATA "Captain of Industry\Saves"
     $saveDir = Join-Path $saveRoot $baseName
@@ -212,9 +218,9 @@ try {
         Write-Host "Creating co-op session..."
         $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session" -ContentType "application/json" -Body "{}" -TimeoutSec 60
 
-        $code = Normalize-SessionCode ([string]$response.code)
-        $token = [string]$response.hostToken
-        $expiresAt = [string]$response.expiresAt
+        $code = Normalize-SessionCode ([string]($response.code))
+        $token = [string]($response.hostToken)
+        $expiresAt = [string]($response.expiresAt)
 
         if ([string]::IsNullOrWhiteSpace($code) -or [string]::IsNullOrWhiteSpace($token)) {
             throw "Relay returned an invalid host session response."
@@ -266,22 +272,22 @@ try {
             throw
         }
 
-        $token = [string]$response.clientToken
-        $expiresAt = [string]$response.expiresAt
+        $token = [string]($response.clientToken)
+        $expiresAt = [string]($response.expiresAt)
         if ([string]::IsNullOrWhiteSpace($token)) {
             throw "Relay returned an invalid client session response."
         }
 
         $snapshotMeta = Get-SnapshotMetaFromJoin $response
         $installedSnapshot = Download-SessionSnapshot -BaseUrl $baseUrl -Code $code -ClientToken $token -SnapshotMeta $snapshotMeta
-        $loadSaveName = [string]$installedSnapshot.LoadName
+        $loadSaveName = [string]($installedSnapshot.LoadName)
 
         Write-Host "Session accepted." -ForegroundColor Green
         if (-not [string]::IsNullOrWhiteSpace($expiresAt)) {
             Write-Host "Expires: $expiresAt"
         }
         Write-Host "LOAD THIS SAVE: $loadSaveName" -ForegroundColor Yellow
-        Write-Host "SHA256: $($installedSnapshot.SHA256)" -ForegroundColor Green
+        Write-Host ("SHA256: " + [string]($installedSnapshot.SHA256)) -ForegroundColor Green
         Write-Host ""
     }
 
