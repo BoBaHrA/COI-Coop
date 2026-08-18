@@ -277,7 +277,12 @@ internal sealed class PlacementPreviewSession : IDisposable {
 
     private static void Configure(TcpClient client) {
         client.NoDelay = true;
-        client.ReceiveTimeout = 5000;
+
+        // Preview/sandbox/path/blueprint sidecars may legitimately be completely
+        // idle for long periods. A finite receive timeout turns normal inactivity
+        // into a disconnect/reconnect loop (previously every ~5 seconds over relay).
+        // Socket closure still interrupts any blocking read during disposal/failure.
+        client.ReceiveTimeout = 0;
         client.SendTimeout = 5000;
     }
 
