@@ -156,7 +156,6 @@ function Remove-StaleSessionCaches([string]$SaveRoot, [string]$KeepCacheName) {
 
         $marker = Join-Path $directory.FullName $SessionCacheMarker
         if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
-            # Reserved-looking user folders are never deleted unless our marker proves ownership.
             continue
         }
 
@@ -250,6 +249,7 @@ try {
     $sessionCacheName = $null
     $sessionCacheGameName = $null
     $hostSnapshotName = $null
+    $baselineSha256 = $null
 
     Write-Host "=== COI-Coop INTERNET $Mode ==="
     Write-Host "Relay: $baseUrl"
@@ -271,7 +271,8 @@ try {
             throw "Relay returned an invalid host session response."
         }
 
-        [void](Publish-SessionSnapshot -BaseUrl $baseUrl -Code $code -HostToken $token -SavePath $sourceSavePath)
+        $publishedSnapshot = Publish-SessionSnapshot -BaseUrl $baseUrl -Code $code -HostToken $token -SavePath $sourceSavePath
+        $baselineSha256 = [string]($publishedSnapshot.sha256)
 
         Write-Host ""
         Write-Host "=========================================" -ForegroundColor Cyan
@@ -331,6 +332,7 @@ try {
         $sessionCacheGameName = [string]($installedSnapshot.GameName)
         $sessionCachePath = [string]($installedSnapshot.Path)
         $hostSnapshotName = [string]($installedSnapshot.HostSnapshotName)
+        $baselineSha256 = [string]($installedSnapshot.SHA256)
 
         Write-Host "Session accepted." -ForegroundColor Green
         if (-not [string]::IsNullOrWhiteSpace($expiresAt)) {
@@ -338,9 +340,13 @@ try {
         }
         Write-Host "Temporary host-world mirror prepared." -ForegroundColor Green
         Write-Host "SESSION CACHE: $loadSaveName" -ForegroundColor Yellow
-        Write-Host ("SHA256: " + [string]($installedSnapshot.SHA256)) -ForegroundColor Green
+        Write-Host ("SHA256: " + $baselineSha256) -ForegroundColor Green
         Write-Host "This cache is disposable and is NOT a client-owned campaign save." -ForegroundColor Cyan
         Write-Host ""
+    }
+
+    if ([string]::IsNullOrWhiteSpace($baselineSha256)) {
+        throw "Verified host snapshot SHA256 is missing; refusing to launch an unbound gameplay session."
     }
 
     # These values exist only in this launcher process and the Captain of Industry
@@ -351,6 +357,7 @@ try {
     $env:COI_COOP_SESSION_CODE = $code
     $env:COI_COOP_SESSION_TOKEN = $token
     $env:COI_COOP_HOST_SNAPSHOT_NAME = $hostSnapshotName
+    $env:COI_COOP_BASELINE_SHA256 = $baselineSha256.ToUpperInvariant()
 
     if ($Mode -eq "Client") {
         $env:COI_COOP_SESSION_CACHE_PATH = $sessionCachePath
