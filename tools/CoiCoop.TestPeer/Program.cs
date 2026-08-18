@@ -160,6 +160,14 @@ while (!cts.IsCancellationRequested && ws.State == WebSocketState.Open) {
             continue;
         }
 
+        if (type == "PROGRESS") {
+            // The real host reports its own progress to the peer as well. This is
+            // expected protocol traffic; the headless client has no simulation
+            // state to compare it with, so silently ignore it instead of flooding
+            // diagnostics with one line per authority frame.
+            continue;
+        }
+
         Console.WriteLine("TEST-PEER ignored line: " + line);
     }
 }
