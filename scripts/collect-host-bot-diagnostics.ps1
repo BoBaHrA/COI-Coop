@@ -24,6 +24,13 @@ $botErr = Get-ChildItem $artifactDir -File -Filter "test-peer-*.err.log" |
 if (-not $gameLog) { throw "No Captain of Industry log was found." }
 if (-not $botLog) { throw "No headless peer log was found." }
 
+$gameCoop = @(Select-String -Path $gameLog.FullName -SimpleMatch "COI-Coop:" | ForEach-Object { $_.Line })
+$botLines = @(Get-Content -LiteralPath $botLog.FullName)
+
+function Count-Matches([string[]]$InputLines, [string]$Needle) {
+    return @($InputLines | Where-Object { $_ -like ("*" + $Needle + "*") }).Count
+}
+
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $outPath = Join-Path $artifactDir ("host-bot-diagnostics-" + $stamp + ".txt")
 $lines = New-Object System.Collections.Generic.List[string]
@@ -31,8 +38,22 @@ $lines = New-Object System.Collections.Generic.List[string]
 $lines.Add("COI-Coop host + headless client diagnostics")
 $lines.Add("Created: " + (Get-Date -Format o))
 $lines.Add("")
+$lines.Add("===== SUMMARY =====")
+$lines.Add("Gameplay WELCOME: " + (Count-Matches $botLines "gameplay WELCOME accepted"))
+$lines.Add("Preview  WELCOME: " + (Count-Matches $botLines "preview preview WELCOME accepted"))
+$lines.Add("Path     WELCOME: " + (Count-Matches $botLines "path preview WELCOME accepted"))
+$lines.Add("Blueprint WELCOME: " + (Count-Matches $botLines "blueprint preview WELCOME accepted"))
+$lines.Add("Preview packets lane1: " + (Count-Matches $botLines "TEST-PEER preview PREVIEW"))
+$lines.Add("Preview packets lane2: " + (Count-Matches $botLines "TEST-PEER path PREVIEW"))
+$lines.Add("Preview packets lane3: " + (Count-Matches $botLines "TEST-PEER blueprint PREVIEW"))
+$lines.Add("Relay disconnects: " + (Count-Matches $gameCoop "relay disconnected"))
+$lines.Add("REPLAY HALT: " + (Count-Matches $gameCoop "REPLAY HALT"))
+$lines.Add("FRAME BLOCKED: " + (Count-Matches $gameCoop "FRAME BLOCKED"))
+$lines.Add("NETWORK RX FAIL: " + (Count-Matches $gameCoop "NETWORK RX FAIL"))
+$lines.Add("SERIALIZE FAIL: " + (Count-Matches $gameCoop "SERIALIZE FAIL"))
+$lines.Add("STATE DESYNC SUSPECTED: " + (Count-Matches $gameCoop "STATE DESYNC SUSPECTED"))
+$lines.Add("")
 $lines.Add("===== GAME LOG: " + $gameLog.Name + " =====")
-$gameCoop = @(Select-String -Path $gameLog.FullName -SimpleMatch "COI-Coop:" | ForEach-Object { $_.Line })
 if ($gameCoop.Count -eq 0) {
     $lines.Add("No COI-Coop lines found.")
 } else {
@@ -41,7 +62,7 @@ if ($gameCoop.Count -eq 0) {
 
 $lines.Add("")
 $lines.Add("===== TEST PEER LOG: " + $botLog.Name + " =====")
-foreach ($line in Get-Content -LiteralPath $botLog.FullName) { $lines.Add($line) }
+foreach ($line in $botLines) { $lines.Add($line) }
 
 if ($botErr -and $botErr.Length -gt 0) {
     $lines.Add("")
