@@ -10,9 +10,16 @@ if not "%COI_COOP_RELAY_URL%"=="" (
   set "RELAYURL=https://coi-coop-relay.onrender.com"
 )
 
+if "%~1"=="" (
+  set "SAVENAME=COOP_LAN_BASE"
+) else (
+  set "SAVENAME=%~1"
+)
+
 echo Relay: %RELAYURL%
+echo Host save: %SAVENAME%
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0launch-internet.ps1" -Mode Host -RelayUrl "%RELAYURL%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0launch-internet.ps1" -Mode Host -RelayUrl "%RELAYURL%" -SourceSaveName "%SAVENAME%"
 set "EXITCODE=%ERRORLEVEL%"
 
 if not "%EXITCODE%"=="0" (
