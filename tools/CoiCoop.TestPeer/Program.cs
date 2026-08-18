@@ -1,7 +1,7 @@
 using System.Net.WebSockets;
 using System.Text;
 
-const int ProtocolVersion = 4;
+const int ProtocolVersion = 5;
 const string ModVersion = "0.0.1";
 const string PreviewHello = "COI_COOP_PREVIEW|1";
 const string PreviewWelcome = "COI_COOP_PREVIEW_OK|1";
@@ -137,6 +137,7 @@ static async Task RunGameplayLaneAsync(
     string code,
     string token,
     string role,
+    string baselineId,
     CancellationTokenSource lifetime) {
 
     var cancellationToken = lifetime.Token;
@@ -205,9 +206,9 @@ static async Task RunGameplayLaneAsync(
                     welcomed = true;
                     Console.WriteLine("TEST-PEER gameplay WELCOME accepted");
                     if (!readySent) {
-                        await SendLineAsync(ws, "READY", cancellationToken);
+                        await SendLineAsync(ws, "READY|" + baselineId, cancellationToken);
                         readySent = true;
-                        Console.WriteLine("TEST-PEER gameplay READY sent");
+                        Console.WriteLine("TEST-PEER gameplay READY sent baseline=" + baselineId[..Math.Min(12, baselineId.Length)]);
                     }
                     continue;
                 }
@@ -251,6 +252,7 @@ static async Task RunGameplayLaneAsync(
 var relayWs = RequireEnv("COI_COOP_RELAY_WS");
 var code = NormalizeCode(RequireEnv("COI_COOP_SESSION_CODE"));
 var token = RequireEnv("COI_COOP_SESSION_TOKEN");
+var baselineId = RequireEnv("COI_COOP_BASELINE_SHA256").ToUpperInvariant();
 var role = (Environment.GetEnvironmentVariable("COI_COOP_TEST_PEER_ROLE") ?? "client").Trim().ToLowerInvariant();
 if (role != "client") {
     throw new InvalidOperationException("This test-peer implementation currently supports client role only.");
@@ -263,7 +265,7 @@ Console.CancelKeyPress += (_, eventArgs) => {
 };
 
 var tasks = new[] {
-    RunGameplayLaneAsync(relayWs, code, token, role, lifetime),
+    RunGameplayLaneAsync(relayWs, code, token, role, baselineId, lifetime),
     RunPreviewLaneAsync(1, "preview", relayWs, code, token, role, lifetime.Token),
     RunPreviewLaneAsync(2, "path", relayWs, code, token, role, lifetime.Token),
     RunPreviewLaneAsync(3, "blueprint", relayWs, code, token, role, lifetime.Token),
