@@ -40,15 +40,45 @@ function Get-CoiProcesses {
     )
 }
 
-function Wait-ForCoiExit([int]$Seconds) {
-    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
-    do {
-        $remaining = @(Get-CoiProcesses)
-        if ($remaining.Count -eq 0) { return @() }
-        Start-Sleep -Milliseconds 250
-    } while ([DateTime]::UtcNow -lt $deadline)
+function Wait-CoiProcessExit([int]$ProcessId, [int]$TimeoutMs) {
+    $started = [Environment]::TickCount
+    while ($true) {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $process) { return $true }
+        if (unchecked([Environment]::TickCount - $started) -ge $TimeoutMs) { return $false }
+        Start-Sleep -Milliseconds 200
+    }
+}
 
-    return @(Get-CoiProcesses)
+function Get-ProcessDetails([int]$ProcessId) {
+    try {
+        $row = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
+        if ($row) {
+            return ("PID {0}, parent PID {1}, path '{2}'" -f $row.ProcessId, $row.ParentProcessId, $row.ExecutablePath)
+        }
+    }
+    catch { }
+    return ("PID {0}" -f $ProcessId)
+}
+
+function Force-KillSingleProcess([int]$ProcessId) {
+    $stdoutPath = Join-Path $env:TEMP ("coi-coop-taskkill-{0}-{1}.out" -f $ProcessId, [Guid]::NewGuid().ToString("N"))
+    $stderrPath = Join-Path $env:TEMP ("coi-coop-taskkill-{0}-{1}.err" -f $ProcessId, [Guid]::NewGuid().ToString("N"))
+    try {
+        # Do NOT use /T here. Captain of Industry may itself be a child of Steam or
+        # another launcher process. We only want to terminate this exact stale COI
+        # process, never its parent or unrelated siblings/children.
+        $killer = Start-Process -FilePath "taskkill.exe" -ArgumentList @("/PID", [string]$ProcessId, "/F") -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $stdout = if (Test-Path $stdoutPath) { (Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) } else { "" }
+        $stderr = if (Test-Path $stderrPath) { (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue) } else { "" }
+        if (-not [string]::IsNullOrWhiteSpace($stdout)) { Write-Host $stdout.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($stderr)) { Write-Host $stderr.Trim() -ForegroundColor Yellow }
+        return $killer.ExitCode
+    }
+    finally {
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Ensure-NoCoiProcesses {
@@ -70,25 +100,28 @@ function Ensure-NoCoiProcesses {
     }
 
     foreach ($process in $running) {
-        Write-Host ("Stopping COI PID {0}..." -f $process.Id) -ForegroundColor Yellow
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-    }
+        $pidToStop = [int]$process.Id
+        Write-Host ("Stopping COI PID {0}..." -f $pidToStop) -ForegroundColor Yellow
+        Stop-Process -Id $pidToStop -Force -ErrorAction SilentlyContinue
 
-    $remaining = @(Wait-ForCoiExit 5)
-    if ($remaining.Count -gt 0) {
-        Write-Host "COI did not exit promptly; using taskkill fallback..." -ForegroundColor Yellow
-        foreach ($process in $remaining) {
-            $taskkillOutput = & taskkill.exe /PID $process.Id /T /F 2>&1
-            if ($taskkillOutput) {
-                $taskkillOutput | ForEach-Object { Write-Host ("  " + $_) }
+        if (-not (Wait-CoiProcessExit -ProcessId $pidToStop -TimeoutMs 5000)) {
+            Write-Host "COI did not exit promptly; using exact-PID taskkill fallback..." -ForegroundColor Yellow
+            $exitCode = Force-KillSingleProcess -ProcessId $pidToStop
+            if ($exitCode -ne 0) {
+                Write-Host ("taskkill exit code: {0}" -f $exitCode) -ForegroundColor Yellow
             }
+            [void](Wait-CoiProcessExit -ProcessId $pidToStop -TimeoutMs 5000)
         }
-        $remaining = @(Wait-ForCoiExit 5)
     }
 
+    $remaining = @(Get-CoiProcesses)
     if ($remaining.Count -gt 0) {
-        $ids = ($remaining | ForEach-Object { [string]$_.Id }) -join ", "
-        throw "Some Captain of Industry processes are still running after Stop-Process and taskkill (PID: $ids). Restart Windows or close them from Task Manager, then retry."
+        Write-Host ""
+        Write-Host "The following COI process(es) survived Stop-Process and exact-PID taskkill:" -ForegroundColor Red
+        foreach ($process in $remaining) {
+            Write-Host ("  " + (Get-ProcessDetails -ProcessId $process.Id)) -ForegroundColor Red
+        }
+        throw "Windows is keeping a stale Captain of Industry process alive. End that exact PID in Task Manager (Details tab) or reboot once, then retry."
     }
 
     Write-Host "Previous COI processes closed." -ForegroundColor Green
