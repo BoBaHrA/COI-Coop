@@ -74,7 +74,9 @@ function makeLaneState() {
     pendingHostToClient: [],
     pendingClientToHost: [],
     pendingHostBytes: 0,
-    pendingClientBytes: 0
+    pendingClientBytes: 0,
+    everPaired: false,
+    resyncRequired: false
   };
 }
 
@@ -107,16 +109,20 @@ function closeSocket(socket, code, reason) {
   }
 }
 
+function clearPending(lane) {
+  lane.pendingHostToClient.length = 0;
+  lane.pendingClientToHost.length = 0;
+  lane.pendingHostBytes = 0;
+  lane.pendingClientBytes = 0;
+}
+
 function disposeSession(session, reason) {
   for (const lane of session.lanes) {
     closeSocket(lane.host, 1001, reason);
     closeSocket(lane.client, 1001, reason);
     lane.host = null;
     lane.client = null;
-    lane.pendingHostToClient.length = 0;
-    lane.pendingClientToHost.length = 0;
-    lane.pendingHostBytes = 0;
-    lane.pendingClientBytes = 0;
+    clearPending(lane);
   }
   sessions.delete(session.code);
 }
@@ -194,8 +200,19 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // Until real snapshot/catch-up exists, a gameplay disconnect invalidates
+      // this deterministic session. Returning the old client token would allow a
+      // freshly loaded stale save to look like a successful reconnect.
+      if (session.lanes[0].resyncRequired) {
+        json(res, 409, {
+          error: 'resync_required',
+          reason: 'gameplay_disconnected_restart_session'
+        });
+        return;
+      }
+
       // One remote player per development session. Repeated calls return the
-      // same token so a launcher can be retried without creating another slot.
+      // same token while the original gameplay session has not been invalidated.
       session.clientClaimed = true;
       json(res, 200, {
         code: session.code,
@@ -240,15 +257,28 @@ function flushPending(lane) {
   if (!lane.host || !lane.client) return;
   if (lane.host.readyState !== WebSocket.OPEN || lane.client.readyState !== WebSocket.OPEN) return;
 
+  lane.everPaired = true;
+
   for (const payload of lane.pendingHostToClient) lane.client.send(payload, { binary: true });
   for (const payload of lane.pendingClientToHost) lane.host.send(payload, { binary: true });
-  lane.pendingHostToClient.length = 0;
-  lane.pendingClientToHost.length = 0;
-  lane.pendingHostBytes = 0;
-  lane.pendingClientBytes = 0;
+  clearPending(lane);
 
   try { lane.host.send('PEER_READY'); } catch { }
   try { lane.client.send('PEER_READY'); } catch { }
+}
+
+function invalidateGameplayLane(session, lane, disconnectedRole) {
+  if (!lane.everPaired || lane.resyncRequired) return;
+
+  lane.resyncRequired = true;
+  clearPending(lane);
+  console.warn(`gameplay resync required session=${session.code} after ${disconnectedRole} disconnect`);
+
+  const peerRole = disconnectedRole === 'host' ? 'client' : 'host';
+  const peer = lane[peerRole];
+  if (peer && peer.readyState === WebSocket.OPEN) {
+    closeSocket(peer, 1012, 'RESYNC_REQUIRED');
+  }
 }
 
 function attachPeer(session, role, laneIndex, ws) {
@@ -276,6 +306,7 @@ function attachPeer(session, role, laneIndex, ws) {
 
   ws.on('close', () => {
     if (lane[role] === ws) lane[role] = null;
+    if (laneIndex === 0) invalidateGameplayLane(session, lane, role);
   });
 
   ws.on('error', error => {
@@ -308,6 +339,18 @@ server.on('upgrade', (req, socket, head) => {
         || laneIndex >= LANE_NAMES.length
         || token !== (role === 'host' ? session.hostToken : session.clientToken)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    if (laneIndex === 0 && session.lanes[0].resyncRequired) {
+      socket.write(
+        'HTTP/1.1 409 Conflict\r\n'
+        + 'Connection: close\r\n'
+        + 'Content-Type: text/plain; charset=utf-8\r\n'
+        + 'X-COI-Coop-Reason: RESYNC_REQUIRED\r\n'
+        + 'Content-Length: 15\r\n\r\n'
+        + 'RESYNC_REQUIRED');
       socket.destroy();
       return;
     }
