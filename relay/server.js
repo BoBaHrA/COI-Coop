@@ -8,6 +8,7 @@ const PORT = Number(process.env.PORT || 10000);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 2 * 60 * 60 * 1000);
 const MAX_MESSAGE_BYTES = Number(process.env.MAX_MESSAGE_BYTES || 16 * 1024 * 1024);
 const MAX_PENDING_BYTES_PER_LANE = Number(process.env.MAX_PENDING_BYTES_PER_LANE || 1024 * 1024);
+const MAX_SNAPSHOT_BYTES = Number(process.env.MAX_SNAPSHOT_BYTES || 64 * 1024 * 1024);
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 25000);
 const SESSION_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const SESSION_CODE_CHARS = 8;
@@ -94,6 +95,7 @@ function createSession() {
     createdAt: now,
     expiresAt: now + SESSION_TTL_MS,
     clientClaimed: false,
+    snapshot: null,
     lanes: LANE_NAMES.map(() => makeLaneState())
   };
   sessions.set(code, session);
@@ -124,6 +126,7 @@ function disposeSession(session, reason) {
     lane.client = null;
     clearPending(lane);
   }
+  session.snapshot = null;
   sessions.delete(session.code);
 }
 
@@ -142,16 +145,24 @@ function readBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
+    let tooLarge = false;
     req.on('data', chunk => {
+      if (tooLarge) return;
       total += chunk.length;
       if (total > maxBytes) {
-        reject(new Error('request body too large'));
-        req.destroy();
+        tooLarge = true;
+        chunks.length = 0;
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
+      if (tooLarge) {
+        const error = new Error('request body too large');
+        error.code = 'BODY_TOO_LARGE';
+        reject(error);
+        return;
+      }
       if (chunks.length === 0) {
         resolve({});
         return;
@@ -164,6 +175,65 @@ function readBody(req, maxBytes = 64 * 1024) {
     });
     req.on('error', reject);
   });
+}
+
+function readRawBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let tooLarge = false;
+    req.on('data', chunk => {
+      if (tooLarge) return;
+      total += chunk.length;
+      if (total > maxBytes) {
+        tooLarge = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (tooLarge) {
+        const error = new Error('snapshot too large');
+        error.code = 'BODY_TOO_LARGE';
+        reject(error);
+        return;
+      }
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('error', reject);
+  });
+}
+
+function safeSnapshotName(value) {
+  const raw = String(value || 'COI_COOP_SYNC.save').trim();
+  const leaf = raw.replace(/^.*[\\/]/, '').replace(/[^A-Za-z0-9._ -]/g, '_').slice(0, 120);
+  return leaf || 'COI_COOP_SYNC.save';
+}
+
+function snapshotMeta(snapshot) {
+  if (!snapshot) return null;
+  return {
+    name: snapshot.name,
+    size: snapshot.buffer.length,
+    sha256: snapshot.sha256,
+    publishedAt: snapshot.publishedAt
+  };
+}
+
+function findSession(codeValue) {
+  const code = normalizeCode(codeValue);
+  const session = code ? sessions.get(code) : null;
+  if (!session || Date.now() >= session.expiresAt) return null;
+  return session;
+}
+
+function hasSessionToken(session, req, role) {
+  if (!session) return false;
+  const token = bearerToken(req);
+  if (role === 'host') return token === session.hostToken;
+  if (role === 'client') return token === session.clientToken;
+  return token === session.hostToken || token === session.clientToken;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -185,24 +255,109 @@ const server = http.createServer(async (req, res) => {
       json(res, 201, {
         code: session.code,
         hostToken: session.hostToken,
-        expiresAt: new Date(session.expiresAt).toISOString()
+        expiresAt: new Date(session.expiresAt).toISOString(),
+        maxSnapshotBytes: MAX_SNAPSHOT_BYTES
       });
+      return;
+    }
+
+    const snapshotMetaMatch = /^\/api\/session\/([^/]+)\/snapshot\/meta$/.exec(url.pathname);
+    if (req.method === 'GET' && snapshotMetaMatch) {
+      const session = findSession(snapshotMetaMatch[1]);
+      if (!session) {
+        json(res, 404, { error: 'session_not_found' });
+        return;
+      }
+      if (!hasSessionToken(session, req, 'either')) {
+        json(res, 401, { error: 'unauthorized' });
+        return;
+      }
+      if (!session.snapshot) {
+        json(res, 404, { error: 'snapshot_not_found' });
+        return;
+      }
+      json(res, 200, snapshotMeta(session.snapshot));
+      return;
+    }
+
+    const snapshotMatch = /^\/api\/session\/([^/]+)\/snapshot$/.exec(url.pathname);
+    if (req.method === 'PUT' && snapshotMatch) {
+      const session = findSession(snapshotMatch[1]);
+      if (!session) {
+        json(res, 404, { error: 'session_not_found' });
+        return;
+      }
+      if (!hasSessionToken(session, req, 'host')) {
+        json(res, 401, { error: 'unauthorized' });
+        return;
+      }
+
+      let buffer;
+      try {
+        buffer = await readRawBody(req, MAX_SNAPSHOT_BYTES);
+      } catch (error) {
+        if (error && error.code === 'BODY_TOO_LARGE') {
+          json(res, 413, { error: 'snapshot_too_large', maxBytes: MAX_SNAPSHOT_BYTES });
+          return;
+        }
+        throw error;
+      }
+      if (buffer.length === 0) {
+        json(res, 400, { error: 'snapshot_empty' });
+        return;
+      }
+
+      const sha256 = crypto.createHash('sha256').update(buffer).digest('hex').toUpperCase();
+      session.snapshot = {
+        name: safeSnapshotName(req.headers['x-coi-save-name']),
+        buffer,
+        sha256,
+        publishedAt: new Date().toISOString()
+      };
+      json(res, 201, snapshotMeta(session.snapshot));
+      console.log(`snapshot published session=${session.code} bytes=${buffer.length} sha256=${sha256}`);
+      return;
+    }
+
+    if (req.method === 'GET' && snapshotMatch) {
+      const session = findSession(snapshotMatch[1]);
+      if (!session) {
+        json(res, 404, { error: 'session_not_found' });
+        return;
+      }
+      if (!hasSessionToken(session, req, 'either')) {
+        json(res, 401, { error: 'unauthorized' });
+        return;
+      }
+      if (!session.snapshot) {
+        json(res, 404, { error: 'snapshot_not_found' });
+        return;
+      }
+
+      const snapshot = session.snapshot;
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-length': String(snapshot.buffer.length),
+        'cache-control': 'no-store',
+        'x-coi-save-name': snapshot.name,
+        'x-coi-save-sha256': snapshot.sha256
+      });
+      res.end(snapshot.buffer);
       return;
     }
 
     const joinMatch = /^\/api\/session\/([^/]+)\/join$/.exec(url.pathname);
     if (req.method === 'POST' && joinMatch) {
       await readBody(req);
-      const code = normalizeCode(joinMatch[1]);
-      const session = code ? sessions.get(code) : null;
-      if (!session || Date.now() >= session.expiresAt) {
+      const session = findSession(joinMatch[1]);
+      if (!session) {
         json(res, 404, { error: 'session_not_found' });
         return;
       }
 
-      // Until real snapshot/catch-up exists, a gameplay disconnect invalidates
-      // this deterministic session. Returning the old client token would allow a
-      // freshly loaded stale save to look like a successful reconnect.
+      // Until real in-process snapshot/catch-up exists, a gameplay disconnect
+      // invalidates this deterministic session. Recovery starts a new session
+      // from a freshly published host snapshot.
       if (session.lanes[0].resyncRequired) {
         json(res, 409, {
           error: 'resync_required',
@@ -217,7 +372,8 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, {
         code: session.code,
         clientToken: session.clientToken,
-        expiresAt: new Date(session.expiresAt).toISOString()
+        expiresAt: new Date(session.expiresAt).toISOString(),
+        snapshot: snapshotMeta(session.snapshot)
       });
       return;
     }
