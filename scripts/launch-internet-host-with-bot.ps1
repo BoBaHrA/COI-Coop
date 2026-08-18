@@ -27,7 +27,8 @@ function To-WebSocketUrl([string]$BaseUrl) {
 }
 
 function Normalize-SessionCode([string]$Value) {
-    $raw = (($Value ?? "").ToUpperInvariant() -replace '[^A-Z0-9]', '')
+    $text = if ($null -eq $Value) { "" } else { [string]$Value }
+    $raw = ($text.ToUpperInvariant() -replace '[^A-Z0-9]', '')
     if ($raw.Length -ne 8) { return $null }
     return $raw.Substring(0, 4) + "-" + $raw.Substring(4, 4)
 }
