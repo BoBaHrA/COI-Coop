@@ -33,6 +33,10 @@ jobs:
           }
           if ($failed) { throw 'One or more PowerShell scripts failed Windows PowerShell 5.1 parsing.' }
 
+      - name: Run host-bot helper runtime smoke test
+        shell: powershell
+        run: .\scripts\launch-internet-host-with-bot.ps1 -SelfTestHelpers
+
       - name: Build headless relay test peer
         shell: powershell
         run: dotnet build tools/CoiCoop.TestPeer/CoiCoop.TestPeer.csproj -c Release --nologo
