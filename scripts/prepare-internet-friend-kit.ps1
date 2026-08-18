@@ -68,7 +68,8 @@ echo Mod installed to: %MODDST%
 echo Relay: $relayBase
 echo.
 echo Enter the SESSION CODE received from the host.
-echo The launcher will download and SHA256-verify the current host snapshot automatically.
+echo The launcher will download and SHA256-verify the canonical host-world snapshot automatically.
+echo No independent client campaign save is installed by this kit.
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\launch-internet.ps1" -Mode Client -RelayUrl "$relayBase"
 set "LAUNCHCODE=%ERRORLEVEL%"
@@ -102,14 +103,19 @@ Set-Content -LiteralPath (Join-Path $stageRoot "INSTALL_AND_LAUNCH.bat") -Value 
 $readme = @"
 COI-Coop internet client test kit
 
+HOST-OWNED WORLD MODEL
+The host owns the only canonical campaign save. This client never provides or owns a separately progressed campaign world.
+
+Current transition flow:
 1. Extract this ZIP to a normal folder.
 2. Make sure Captain of Industry is closed.
 3. Run INSTALL_AND_LAUNCH.bat.
 4. Enter the session code sent by the host.
-5. The launcher downloads the host's current synchronized save and verifies its SHA256 automatically.
-6. If the launcher cannot find Captain of Industry automatically, use Steam -> Captain of Industry -> Properties -> Installed Files -> Browse and paste that folder path.
-7. In Captain of Industry, enable 'COI Co-op Prototype' if needed.
-8. Load the *_CLIENT save name printed by the launcher.
+5. The launcher downloads the host's current snapshot and verifies SHA256 automatically.
+6. The downloaded file is stored under a reserved __COI_COOP_SESSION_<CODE> name. It is a disposable synchronization cache, not a client save.
+7. If the launcher cannot find Captain of Industry automatically, use Steam -> Captain of Industry -> Properties -> Installed Files -> Browse and paste that folder path.
+8. In Captain of Industry, enable 'COI Co-op Prototype' if needed.
+9. Until menu auto-join is finished, load the SESSION CACHE name printed by the launcher. Gameplay READY is accepted only if its snapshot hash matches the host baseline.
 
 Relay:
 $relayBase
@@ -117,6 +123,7 @@ $relayBase
 Both PCs must use the same Captain of Industry version and the same COI-Coop build.
 The session token is obtained at launch time and is not stored in this ZIP.
 No save is bundled in this ZIP: every session receives the exact host snapshot through the authenticated relay and verifies SHA256 before launching.
+Old marked COI-Coop session-cache directories are automatically cleaned by later Join attempts.
 
 CoiCoop.dll SHA256:
 $dllHash
@@ -127,7 +134,8 @@ $manifest = @"
 COI-Coop internet friend kit
 Created: $(Get-Date -Format o)
 Relay=$relayBase
-Save payload=none; synchronized snapshot is downloaded at join time
+Persistence=host-owned; client campaign save=none
+Snapshot cache=downloaded and SHA256-verified at join time
 CoiCoop.dll SHA256=$dllHash
 "@
 Set-Content -LiteralPath (Join-Path $stageRoot "SHA256.txt") -Value $manifest -Encoding ASCII
@@ -140,4 +148,4 @@ Write-Host "ZIP:   $zipPath"
 Write-Host "Relay: $relayBase"
 Write-Host "Mod SHA256: $dllHash"
 Write-Host ""
-Write-Host "No save is bundled. Send this ZIP once; future sessions only need a session code."
+Write-Host "No campaign save is bundled. The host owns persistence; clients receive disposable verified session caches."
