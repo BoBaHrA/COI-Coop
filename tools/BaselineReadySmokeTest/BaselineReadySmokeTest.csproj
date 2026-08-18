@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\CoiCoop\Networking\NetworkProtocol.cs" Link="Networking\NetworkProtocol.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\AuthorityCommandEnvelope.cs" Link="Networking\AuthorityCommandEnvelope.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\AuthorityCommandSequencer.cs" Link="Networking\AuthorityCommandSequencer.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\ReceivedAuthorityCommand.cs" Link="Networking\ReceivedAuthorityCommand.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\StateProbeSnapshot.cs" Link="Networking\StateProbeSnapshot.cs" />
+    <Compile Include="..\..\src\CoiCoop\Networking\PersistentCommandSession.cs" Link="Networking\PersistentCommandSession.cs" />
+  </ItemGroup>
+</Project>

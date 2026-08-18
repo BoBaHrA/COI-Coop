@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: coi-coop-relay
+    runtime: node
+    rootDir: relay
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    plan: free

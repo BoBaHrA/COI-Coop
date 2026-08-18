@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <LangVersion>latest</LangVersion>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyName>CoiCoop</AssemblyName>
+    <COI_MODS>$(APPDATA)\Captain of Industry\Mods</COI_MODS>
+    <DeployToModsFolder>true</DeployToModsFolder>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <Target Name="ValidateCoiRoot" BeforeTargets="ResolveReferences"
+          Condition="'$(COI_ROOT)' == '' Or !Exists('$(COI_ROOT)\Captain of Industry_Data\Managed\Mafi.dll')">
+    <Error Text="COI_ROOT must point to the Captain of Industry installation directory." />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="Mafi">
+      <HintPath>$(COI_ROOT)\Captain of Industry_Data\Managed\Mafi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Mafi.Core">
+      <HintPath>$(COI_ROOT)\Captain of Industry_Data\Managed\Mafi.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="DeployMod" AfterTargets="Build" Condition="'$(DeployToModsFolder)' == 'true'">
+    <MakeDir Directories="$(COI_MODS)\CoiCoop" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(COI_MODS)\CoiCoop" />
+    <Copy SourceFiles="$(ProjectDir)manifest.json" DestinationFolder="$(COI_MODS)\CoiCoop" />
+    <Copy SourceFiles="$(ProjectDir)config.json" DestinationFolder="$(COI_MODS)\CoiCoop" />
+  </Target>
+</Project>

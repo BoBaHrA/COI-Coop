@@ -1,0 +1,240 @@
+using System;
+using System.Globalization;
+
+namespace CoiCoop.Networking;
+
+internal static class NetworkProtocol {
+    public const int ProtocolVersion = 5;
+    public const string ModVersion = "0.0.1";
+
+    public static string Hello() => $"HELLO|{ProtocolVersion}|{ModVersion}";
+    public static string Welcome() => $"WELCOME|{ProtocolVersion}|{ModVersion}";
+
+    public static string Ready(string baselineId) {
+        if (string.IsNullOrWhiteSpace(baselineId)) {
+            throw new ArgumentException("Baseline id is required.", nameof(baselineId));
+        }
+        if (baselineId.IndexOf('|') >= 0) {
+            throw new ArgumentException("Baseline id may not contain '|'.", nameof(baselineId));
+        }
+        return "READY|" + baselineId;
+    }
+
+    public static string Ping(long nonce) => $"PING|{nonce}";
+    public static string Pong(long nonce) => $"PONG|{nonce}";
+    public static string Frame(long authorityFrame) => $"FRAME|{authorityFrame}";
+    public static string Progress(long authorityFrame, long appliedThroughSequence)
+        => $"PROGRESS|{authorityFrame}|{appliedThroughSequence}";
+
+    public static string StateProbe(StateProbeSnapshot probe) {
+        if (probe == null) throw new ArgumentNullException(nameof(probe));
+
+        return "STATE|"
+            + probe.AuthorityFrame.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.AuthoritySequence.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.SimulationStep.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.EntityCount.ToString(CultureInfo.InvariantCulture) + "|"
+            + probe.EntityIdHash.ToString("X16", CultureInfo.InvariantCulture) + "|"
+            + probe.EntityStateHash.ToString("X16", CultureInfo.InvariantCulture) + "|"
+            + probe.HashedMemberCount.ToString(CultureInfo.InvariantCulture);
+    }
+
+    public static string Submit(long clientCommandId, byte[] payload) {
+        if (payload == null) throw new ArgumentNullException(nameof(payload));
+        return "SUBMIT|" + clientCommandId + "|" + Convert.ToBase64String(payload);
+    }
+
+    // Compatibility overload used by the standalone transport smoke tests.
+    public static string Commit(
+        long authoritySequence,
+        string originClientId,
+        long clientCommandId,
+        byte[] payload) {
+
+        return Commit(authoritySequence, -1, originClientId, clientCommandId, payload);
+    }
+
+    public static string Commit(
+        long authoritySequence,
+        long authorityFrame,
+        string originClientId,
+        long clientCommandId,
+        byte[] payload) {
+
+        if (string.IsNullOrEmpty(originClientId)) throw new ArgumentException("Origin is required.", nameof(originClientId));
+        if (originClientId.IndexOf('|') >= 0) throw new ArgumentException("Origin may not contain '|'.", nameof(originClientId));
+        if (payload == null) throw new ArgumentNullException(nameof(payload));
+
+        return "COMMIT|"
+            + authoritySequence + "|"
+            + authorityFrame + "|"
+            + originClientId + "|"
+            + clientCommandId + "|"
+            + Convert.ToBase64String(payload);
+    }
+
+    public static bool IsCompatibleHello(string line) {
+        if (!TrySplit(line, "HELLO", out var parts) || parts.Length != 3) {
+            return false;
+        }
+
+        return int.TryParse(parts[1], out var protocol)
+            && protocol == ProtocolVersion
+            && string.Equals(parts[2], ModVersion, StringComparison.Ordinal);
+    }
+
+    public static bool IsCompatibleWelcome(string line) {
+        if (!TrySplit(line, "WELCOME", out var parts) || parts.Length != 3) {
+            return false;
+        }
+
+        return int.TryParse(parts[1], out var protocol)
+            && protocol == ProtocolVersion
+            && string.Equals(parts[2], ModVersion, StringComparison.Ordinal);
+    }
+
+    public static bool TryReadReady(string line, out string baselineId) {
+        baselineId = null;
+        if (!TrySplit(line, "READY", out var parts)
+            || parts.Length != 2
+            || string.IsNullOrWhiteSpace(parts[1])) {
+            return false;
+        }
+
+        baselineId = parts[1].Trim();
+        return baselineId.IndexOf('|') < 0;
+    }
+
+    public static bool TryReadPing(string line, out long nonce) => TryReadNonce(line, "PING", out nonce);
+    public static bool TryReadPong(string line, out long nonce) => TryReadNonce(line, "PONG", out nonce);
+    public static bool TryReadFrame(string line, out long authorityFrame) => TryReadNonce(line, "FRAME", out authorityFrame);
+
+    public static bool TryReadProgress(
+        string line,
+        out long authorityFrame,
+        out long appliedThroughSequence) {
+
+        authorityFrame = -1;
+        appliedThroughSequence = -1;
+
+        return TrySplit(line, "PROGRESS", out var parts)
+            && parts.Length == 3
+            && long.TryParse(parts[1], out authorityFrame)
+            && long.TryParse(parts[2], out appliedThroughSequence);
+    }
+
+    public static bool TryReadStateProbe(string line, out StateProbeSnapshot probe) {
+        probe = null;
+
+        long frame;
+        long sequence;
+        long step;
+        int entityCount;
+        ulong entityIdHash;
+        ulong entityStateHash;
+        int memberCount;
+
+        if (!TrySplit(line, "STATE", out var parts)
+            || parts.Length != 8
+            || !long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out frame)
+            || !long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out sequence)
+            || !long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out step)
+            || !int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out entityCount)
+            || !ulong.TryParse(parts[5], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out entityIdHash)
+            || !ulong.TryParse(parts[6], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out entityStateHash)
+            || !int.TryParse(parts[7], NumberStyles.Integer, CultureInfo.InvariantCulture, out memberCount)) {
+            return false;
+        }
+
+        probe = new StateProbeSnapshot(
+            frame,
+            sequence,
+            step,
+            entityCount,
+            entityIdHash,
+            entityStateHash,
+            memberCount);
+        return true;
+    }
+
+    public static bool TryReadSubmit(string line, out long clientCommandId, out byte[] payload) {
+        clientCommandId = 0;
+        payload = null;
+
+        if (!TrySplit(line, "SUBMIT", out var parts)
+            || parts.Length != 3
+            || !long.TryParse(parts[1], out clientCommandId)) {
+            return false;
+        }
+
+        return TryDecodePayload(parts[2], out payload);
+    }
+
+    // Compatibility overload used by existing callers that do not inspect frames.
+    public static bool TryReadCommit(
+        string line,
+        out long authoritySequence,
+        out string originClientId,
+        out long clientCommandId,
+        out byte[] payload) {
+
+        long ignoredAuthorityFrame;
+        return TryReadCommit(
+            line,
+            out authoritySequence,
+            out ignoredAuthorityFrame,
+            out originClientId,
+            out clientCommandId,
+            out payload);
+    }
+
+    public static bool TryReadCommit(
+        string line,
+        out long authoritySequence,
+        out long authorityFrame,
+        out string originClientId,
+        out long clientCommandId,
+        out byte[] payload) {
+
+        authoritySequence = 0;
+        authorityFrame = -1;
+        originClientId = null;
+        clientCommandId = 0;
+        payload = null;
+
+        if (!TrySplit(line, "COMMIT", out var parts)
+            || parts.Length != 6
+            || !long.TryParse(parts[1], out authoritySequence)
+            || !long.TryParse(parts[2], out authorityFrame)
+            || string.IsNullOrEmpty(parts[3])
+            || !long.TryParse(parts[4], out clientCommandId)) {
+            return false;
+        }
+
+        originClientId = parts[3];
+        return TryDecodePayload(parts[5], out payload);
+    }
+
+    private static bool TryReadNonce(string line, string expectedType, out long nonce) {
+        nonce = 0;
+        return TrySplit(line, expectedType, out var parts)
+            && parts.Length == 2
+            && long.TryParse(parts[1], out nonce);
+    }
+
+    private static bool TryDecodePayload(string encoded, out byte[] payload) {
+        payload = null;
+        try {
+            payload = Convert.FromBase64String(encoded ?? string.Empty);
+            return true;
+        }
+        catch (FormatException) {
+            return false;
+        }
+    }
+
+    private static bool TrySplit(string line, string expectedType, out string[] parts) {
+        parts = (line ?? string.Empty).Split('|');
+        return parts.Length > 0 && string.Equals(parts[0], expectedType, StringComparison.Ordinal);
+    }
+}

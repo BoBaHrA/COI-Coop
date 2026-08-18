@@ -1,0 +1,30 @@
+name: Transport smoke test
+
+on:
+  push:
+    branches:
+      - main
+      - dev/network-foundation
+  pull_request:
+
+jobs:
+  transport-smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run transport smoke test
+        run: dotnet run --project tools/TransportSmokeTest/TransportSmokeTest.csproj --configuration Release
+
+      - name: Run snapshot baseline READY smoke test
+        run: dotnet run --project tools/BaselineReadySmokeTest/BaselineReadySmokeTest.csproj --configuration Release
+
+      - name: Run preview sidecar smoke test
+        run: dotnet run --project tools/PreviewSmokeTest/PreviewSmokeTest.csproj --configuration Release

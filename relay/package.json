@@ -1,0 +1,17 @@
+{
+  "name": "coi-coop-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rendezvous and WebSocket byte relay for the COI-Coop development transport.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test:smoke": "node smoke-test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
