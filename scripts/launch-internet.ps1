@@ -46,6 +46,16 @@ function To-WebSocketUrl([string]$BaseUrl) {
     return "${scheme}://$($uri.Authority)/relay"
 }
 
+function Get-HttpStatusCodeFromError($ErrorRecord) {
+    try {
+        if ($ErrorRecord -and $ErrorRecord.Exception -and $ErrorRecord.Exception.Response) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch { }
+    return 0
+}
+
 try {
     $baseUrl = Normalize-RelayBase $RelayUrl
     $wsUrl = To-WebSocketUrl $baseUrl
@@ -83,6 +93,9 @@ try {
         Write-Host "2. Your friend loads COOP_LAN_BASE_CLIENT and waits in the world."
         Write-Host "3. Only then press ENTER here to start the HOST game." -ForegroundColor Green
         Write-Host ""
+        Write-Host "If gameplay disconnects, this code is intentionally invalidated." -ForegroundColor Yellow
+        Write-Host "Until snapshot recovery is implemented, both peers must restart from a fresh synchronized session."
+        Write-Host ""
         [void](Read-Host "Press ENTER after the client save is loaded")
         Write-Host "Starting host Captain of Industry..."
         Write-Host ""
@@ -97,7 +110,16 @@ try {
         }
 
         Write-Host "Joining session $code..."
-        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session/$code/join" -ContentType "application/json" -Body "{}" -TimeoutSec 60
+        try {
+            $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session/$code/join" -ContentType "application/json" -Body "{}" -TimeoutSec 60
+        }
+        catch {
+            $status = Get-HttpStatusCodeFromError $_
+            if ($status -eq 409) {
+                throw "RESYNC REQUIRED: gameplay in session $code was already connected and then disconnected. Reusing this code with a freshly loaded old save is unsafe. Ask the host to create a NEW session code and restart both peers from synchronized saves."
+            }
+            throw
+        }
 
         $token = [string]$response.clientToken
         $expiresAt = [string]$response.expiresAt
