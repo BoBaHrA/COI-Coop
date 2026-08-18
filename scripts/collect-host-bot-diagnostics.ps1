@@ -54,6 +54,7 @@ $lines.Add("Game placement TX starts: " + (Count-Matches $gameCoop "PREVIEW GHOS
 $lines.Add("Game placement-multi TX starts: " + (Count-Matches $gameCoop "PREVIEW MULTI GHOST TX START"))
 $lines.Add("Game path TX starts: " + (Count-Matches $gameCoop "PATH GHOST TX START"))
 $lines.Add("Game blueprint TX starts: " + (Count-Matches $gameCoop "BLUEPRINT GHOST TX START"))
+$lines.Add("Baseline mismatches: " + (Count-Matches $gameCoop "BASELINE MISMATCH"))
 $lines.Add("Relay disconnects: " + (Count-Matches $gameCoop "relay disconnected"))
 $lines.Add("REPLAY HALT: " + (Count-Matches $gameCoop "REPLAY HALT"))
 $lines.Add("FRAME BLOCKED: " + (Count-Matches $gameCoop "FRAME BLOCKED"))
