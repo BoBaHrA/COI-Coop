@@ -2,7 +2,8 @@ param(
     [string]$SourceSaveName = "COOP_LAN_BASE",
     [string]$RelayUrl = "https://coi-coop-relay.onrender.com",
     [ValidateRange(1024, 65532)]
-    [int]$Port = 27015
+    [int]$Port = 27015,
+    [switch]$SelfTestHelpers
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,12 +42,17 @@ function Get-CoiProcesses {
 }
 
 function Wait-CoiProcessExit([int]$ProcessId, [int]$TimeoutMs) {
-    $started = [Environment]::TickCount
-    while ($true) {
-        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-        if ($null -eq $process) { return $true }
-        if (unchecked([Environment]::TickCount - $started) -ge $TimeoutMs) { return $false }
-        Start-Sleep -Milliseconds 200
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($true) {
+            $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if ($null -eq $process) { return $true }
+            if ($timer.ElapsedMilliseconds -ge $TimeoutMs) { return $false }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    finally {
+        $timer.Stop()
     }
 }
 
@@ -126,6 +132,23 @@ function Ensure-NoCoiProcesses {
 
     Write-Host "Previous COI processes closed." -ForegroundColor Green
     Write-Host ""
+}
+
+if ($SelfTestHelpers) {
+    $waitResult = Wait-CoiProcessExit -ProcessId $PID -TimeoutMs 50
+    if ($waitResult) {
+        throw "Wait-CoiProcessExit self-test unexpectedly reported the current PowerShell process as exited."
+    }
+    $normalized = Normalize-SessionCode "abcd-2345"
+    if ($normalized -ne "ABCD-2345") {
+        throw "Normalize-SessionCode self-test failed: $normalized"
+    }
+    $relay = Normalize-RelayBase "https://coi-coop-relay.onrender.com/"
+    if ($relay -ne "https://coi-coop-relay.onrender.com") {
+        throw "Normalize-RelayBase self-test failed: $relay"
+    }
+    Write-Host "HOST+BOT HELPER SELF-TEST PASSED" -ForegroundColor Green
+    exit 0
 }
 
 try {
