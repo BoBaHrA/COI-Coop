@@ -22,6 +22,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     private readonly bool m_isHost;
     private readonly int m_port;
     private readonly Action<string> m_log;
+    private readonly string m_baselineId;
     private readonly ConcurrentQueue<string> m_outgoing = new ConcurrentQueue<string>();
     private readonly ConcurrentQueue<ReceivedAuthorityCommand> m_incoming = new ConcurrentQueue<ReceivedAuthorityCommand>();
     private readonly ConcurrentQueue<StateProbeSnapshot> m_incomingStateProbes = new ConcurrentQueue<StateProbeSnapshot>();
@@ -45,6 +46,7 @@ internal sealed class PersistentCommandSession : IDisposable {
         m_isHost = isHost;
         m_port = port;
         m_log = log;
+        m_baselineId = NormalizeBaselineId(Environment.GetEnvironmentVariable("COI_COOP_BASELINE_SHA256"));
     }
 
     public bool IsHost => m_isHost;
@@ -52,6 +54,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     public bool IsGameplayReady => m_localGameplayReady;
     public bool PeerGameplayReady => m_peerGameplayReady;
     public string LocalClientId => m_isHost ? "host" : "client";
+    public string LocalBaselineId => m_baselineId;
     public long LatestAnnouncedAuthorityFrame => Interlocked.Read(ref m_latestAnnouncedAuthorityFrame);
 
     public void Start() {
@@ -68,8 +71,8 @@ internal sealed class PersistentCommandSession : IDisposable {
 
     /// <summary>
     /// Called from the first outer simulation batch after the save is actually
-    /// ready. The client sends READY so the host cannot start frame 0 while the
-    /// second process is still loading the world.
+    /// ready. The client sends READY with the verified snapshot baseline so the
+    /// host cannot start frame 0 against a different world image.
     /// </summary>
     public void MarkGameplayReady() {
         if (!m_connected || m_localGameplayReady) {
@@ -78,8 +81,8 @@ internal sealed class PersistentCommandSession : IDisposable {
 
         m_localGameplayReady = true;
         if (!m_isHost) {
-            m_outgoing.Enqueue(NetworkProtocol.Ready());
-            m_log?.Invoke("CLIENT gameplay READY queued");
+            m_outgoing.Enqueue(NetworkProtocol.Ready(m_baselineId));
+            m_log?.Invoke("CLIENT gameplay READY queued baseline=" + ShortBaseline(m_baselineId));
         }
     }
 
@@ -361,10 +364,21 @@ internal sealed class PersistentCommandSession : IDisposable {
             return;
         }
 
-        if (NetworkProtocol.IsReady(line)) {
+        string peerBaseline;
+        if (NetworkProtocol.TryReadReady(line, out peerBaseline)) {
             if (m_isHost) {
+                if (!string.Equals(peerBaseline, m_baselineId, StringComparison.OrdinalIgnoreCase)) {
+                    m_peerGameplayReady = false;
+                    m_log?.Invoke(
+                        "HOST BASELINE MISMATCH - gameplay READY rejected local="
+                        + ShortBaseline(m_baselineId)
+                        + " peer=" + ShortBaseline(peerBaseline));
+                    return;
+                }
+
                 m_peerGameplayReady = true;
-                m_log?.Invoke("HOST received client gameplay READY");
+                m_log?.Invoke(
+                    "HOST received client gameplay READY baseline=" + ShortBaseline(peerBaseline));
             }
             return;
         }
@@ -479,7 +493,9 @@ internal sealed class PersistentCommandSession : IDisposable {
         }
         while (m_incomingStateProbes.TryDequeue(out _)) {
         }
-        m_log?.Invoke(m_isHost ? "HOST session connected" : "CLIENT session connected");
+        m_log?.Invoke(
+            (m_isHost ? "HOST session connected" : "CLIENT session connected")
+            + " baseline=" + ShortBaseline(m_baselineId));
     }
 
     private void SetDisconnected() {
@@ -494,6 +510,16 @@ internal sealed class PersistentCommandSession : IDisposable {
         }
         while (m_incomingStateProbes.TryDequeue(out _)) {
         }
+    }
+
+    private static string NormalizeBaselineId(string value) {
+        var normalized = (value ?? string.Empty).Trim();
+        return normalized.Length == 0 ? "UNSPECIFIED" : normalized.ToUpperInvariant();
+    }
+
+    private static string ShortBaseline(string value) {
+        if (string.IsNullOrEmpty(value)) return "<none>";
+        return value.Length <= 12 ? value : value.Substring(0, 12);
     }
 
     private static void ConfigureClient(TcpClient client) {
