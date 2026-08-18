@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'scripts/**/*.ps1'
+      - 'tools/CoiCoop.TestPeer/**'
       - '.github/workflows/windows-powershell-smoke.yml'
   workflow_dispatch:
 
@@ -31,3 +32,7 @@ jobs:
             }
           }
           if ($failed) { throw 'One or more PowerShell scripts failed Windows PowerShell 5.1 parsing.' }
+
+      - name: Build headless relay test peer
+        shell: powershell
+        run: dotnet build tools/CoiCoop.TestPeer/CoiCoop.TestPeer.csproj -c Release --nologo
