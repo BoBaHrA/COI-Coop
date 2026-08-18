@@ -149,10 +149,11 @@ function Remove-StaleSessionCaches([string]$SaveRoot, [string]$KeepCacheName) {
 
     $directories = @(Get-ChildItem -LiteralPath $SaveRoot -Directory -Filter ($SessionCachePrefix + "*") -ErrorAction SilentlyContinue)
     foreach ($directory in $directories) {
-        if (-not [string]::IsNullOrWhiteSpace($KeepCacheName)
-            -and [string]::Equals($directory.Name, $KeepCacheName, [StringComparison]::OrdinalIgnoreCase)) {
-            continue
+        $keepCurrent = $false
+        if (-not [string]::IsNullOrWhiteSpace($KeepCacheName)) {
+            $keepCurrent = [string]::Equals($directory.Name, $KeepCacheName, [StringComparison]::OrdinalIgnoreCase)
         }
+        if ($keepCurrent) { continue }
 
         $marker = Join-Path $directory.FullName $SessionCacheMarker
         if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
@@ -218,7 +219,7 @@ function Download-SessionSnapshot(
             "session=$Code",
             "hostSnapshotName=$metaName",
             "sha256=$actualHash",
-            "created=" + (Get-Date -Format o),
+            ("created=" + (Get-Date -Format o)),
             "This directory is not an independent campaign save and may be deleted by COI-Coop."
         )
         Set-Content -LiteralPath $marker -Value $markerText -Encoding UTF8
@@ -349,8 +350,6 @@ try {
         throw "Verified host snapshot SHA256 is missing; refusing to launch an unbound gameplay session."
     }
 
-    # These values exist only in this launcher process and the Captain of Industry
-    # child process. Session tokens are never persisted to disk.
     $env:COI_COOP_LAN = "0"
     $env:COI_COOP_RELAY = "1"
     $env:COI_COOP_RELAY_WS = $wsUrl
