@@ -33,15 +33,49 @@ function Normalize-SessionCode([string]$Value) {
     return $raw.Substring(0, 4) + "-" + $raw.Substring(4, 4)
 }
 
-function Assert-NoCoiProcesses {
-    $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like "Captain*Industry*" })
-    if ($running.Count -gt 0) {
-        throw "Close all Captain of Industry windows before starting the host+bot test."
+function Get-CoiProcesses {
+    return @(
+        Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -like "Captain*Industry*" }
+    )
+}
+
+function Ensure-NoCoiProcesses {
+    $running = @(Get-CoiProcesses)
+    if ($running.Count -eq 0) { return }
+
+    Write-Host "Captain of Industry process(es) from a previous test are still running:" -ForegroundColor Yellow
+    foreach ($process in $running) {
+        $title = ""
+        try { $title = [string]$process.MainWindowTitle } catch { }
+        if ([string]::IsNullOrWhiteSpace($title)) { $title = "(no visible window title)" }
+        Write-Host ("  PID {0}  {1}  {2}" -f $process.Id, $process.ProcessName, $title)
     }
+    Write-Host ""
+    Write-Host "A clean host+bot test must start with zero COI processes." -ForegroundColor Yellow
+    $answer = Read-Host "Close ONLY these Captain of Industry processes now? [Y/N]"
+    if ($answer -notmatch '^(?i:y|yes)$') {
+        throw "Close all Captain of Industry processes and re-run the host+bot test."
+    }
+
+    foreach ($process in $running) {
+        Write-Host ("Stopping COI PID {0}..." -f $process.Id) -ForegroundColor Yellow
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+
+    Start-Sleep -Milliseconds 750
+    $remaining = @(Get-CoiProcesses)
+    if ($remaining.Count -gt 0) {
+        $ids = ($remaining | ForEach-Object { [string]$_.Id }) -join ", "
+        throw "Some Captain of Industry processes are still running (PID: $ids). Close them manually and retry."
+    }
+
+    Write-Host "Previous COI processes closed." -ForegroundColor Green
+    Write-Host ""
 }
 
 try {
-    Assert-NoCoiProcesses
+    Ensure-NoCoiProcesses
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
     $artifactDir = Join-Path $repoRoot "artifacts\headless-peer"
     New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
