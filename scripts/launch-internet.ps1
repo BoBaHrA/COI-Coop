@@ -19,6 +19,9 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$SessionCachePrefix = "__COI_COOP_SESSION_"
+$SessionCacheMarker = ".coi-coop-session-cache"
+
 function Normalize-RelayBase([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) {
         throw "Relay URL is required."
@@ -102,7 +105,7 @@ function Publish-SessionSnapshot(
         "X-COI-Save-Name" = [IO.Path]::GetFileName($SavePath)
     }
 
-    Write-Host "Publishing synchronized starting save to relay..."
+    Write-Host "Publishing canonical host-world snapshot to relay..."
     $web = Invoke-WebRequest `
         -Method Put `
         -Uri "$BaseUrl/api/session/$Code/snapshot" `
@@ -118,7 +121,7 @@ function Publish-SessionSnapshot(
         $metaHash = [string]($meta.sha256)
     }
     if ($null -eq $meta -or [string]::IsNullOrWhiteSpace($metaHash) -or -not [string]::Equals($metaHash, $hash, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Relay snapshot hash did not match the local host save."
+        throw "Relay snapshot hash did not match the canonical host save."
     }
 
     Write-Host ("Snapshot: {0} bytes" -f [string]($meta.size))
@@ -133,16 +136,38 @@ function Get-SnapshotMetaFromJoin($JoinResponse) {
     return $property.Value
 }
 
-function Get-ClientSaveBaseName([string]$SnapshotName) {
-    $baseName = [IO.Path]::GetFileNameWithoutExtension($SnapshotName)
-    if ($baseName.EndsWith("_HOST", [StringComparison]::OrdinalIgnoreCase)) {
-        $baseName = $baseName.Substring(0, $baseName.Length - 5)
+function Get-SessionCacheName([string]$Code) {
+    $raw = ($Code.ToUpperInvariant() -replace '[^A-Z0-9]', '')
+    if ($raw.Length -ne 8) {
+        throw "Cannot create session cache name from invalid session code '$Code'."
     }
-    if ($baseName.EndsWith("_CLIENT", [StringComparison]::OrdinalIgnoreCase)) {
-        $baseName = $baseName.Substring(0, $baseName.Length - 7)
+    return $SessionCachePrefix + $raw
+}
+
+function Remove-StaleSessionCaches([string]$SaveRoot, [string]$KeepCacheName) {
+    if (-not (Test-Path -LiteralPath $SaveRoot -PathType Container)) { return }
+
+    $directories = @(Get-ChildItem -LiteralPath $SaveRoot -Directory -Filter ($SessionCachePrefix + "*") -ErrorAction SilentlyContinue)
+    foreach ($directory in $directories) {
+        if (-not [string]::IsNullOrWhiteSpace($KeepCacheName)
+            -and [string]::Equals($directory.Name, $KeepCacheName, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $marker = Join-Path $directory.FullName $SessionCacheMarker
+        if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+            # Reserved-looking user folders are never deleted unless our marker proves ownership.
+            continue
+        }
+
+        try {
+            Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction Stop
+            Write-Host "Removed stale COI-Coop session cache: $($directory.Name)"
+        }
+        catch {
+            Write-Host "Could not remove stale session cache '$($directory.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
-    if ([string]::IsNullOrWhiteSpace($baseName)) { $baseName = "COI_COOP_SYNC" }
-    return $baseName
 }
 
 function Download-SessionSnapshot(
@@ -152,26 +177,29 @@ function Download-SessionSnapshot(
     $SnapshotMeta) {
 
     if ($null -eq $SnapshotMeta) {
-        throw "This session has no synchronized host snapshot. Ask the host to use the current Internet launcher."
+        throw "This session has no canonical host snapshot. Ask the host to use the current Internet launcher."
     }
 
     $metaHash = [string]($SnapshotMeta.sha256)
     $metaName = [string]($SnapshotMeta.name)
     if ([string]::IsNullOrWhiteSpace($metaHash) -or [string]::IsNullOrWhiteSpace($metaName)) {
-        throw "This session has invalid snapshot metadata. Ask the host to create a new session."
+        throw "This session has invalid host snapshot metadata. Ask the host to create a new session."
     }
 
     $expectedHash = $metaHash.ToUpperInvariant()
-    $baseName = Get-ClientSaveBaseName $metaName
-    $clientLeaf = $baseName + "_CLIENT.save"
+    $cacheName = Get-SessionCacheName $Code
     $saveRoot = Join-Path $env:APPDATA "Captain of Industry\Saves"
-    $saveDir = Join-Path $saveRoot $baseName
-    $destination = Join-Path $saveDir $clientLeaf
+    $cacheDir = Join-Path $saveRoot $cacheName
+    $destination = Join-Path $cacheDir ($cacheName + ".save")
+    $marker = Join-Path $cacheDir $SessionCacheMarker
     $temp = Join-Path $env:TEMP ("coi-coop-snapshot-" + [Guid]::NewGuid().ToString("N") + ".save")
 
-    New-Item -ItemType Directory -Path $saveDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $saveRoot -Force | Out-Null
+    Remove-StaleSessionCaches -SaveRoot $saveRoot -KeepCacheName $cacheName
+    New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+
     try {
-        Write-Host "Downloading synchronized host snapshot..."
+        Write-Host "Downloading canonical host-world snapshot..."
         Invoke-WebRequest `
             -Method Get `
             -Uri "$BaseUrl/api/session/$Code/snapshot" `
@@ -182,15 +210,27 @@ function Download-SessionSnapshot(
 
         $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $temp).Hash
         if (-not [string]::Equals($actualHash, $expectedHash, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Downloaded snapshot SHA256 mismatch. Expected $expectedHash but got $actualHash."
+            throw "Downloaded host snapshot SHA256 mismatch. Expected $expectedHash but got $actualHash."
         }
 
         Move-Item -LiteralPath $temp -Destination $destination -Force
-        Write-Host "Snapshot SHA256 verified." -ForegroundColor Green
-        Write-Host "Installed client save: $destination"
+        $markerText = @(
+            "COI-Coop disposable session cache",
+            "session=$Code",
+            "hostSnapshotName=$metaName",
+            "sha256=$actualHash",
+            "created=" + (Get-Date -Format o),
+            "This directory is not an independent campaign save and may be deleted by COI-Coop."
+        )
+        Set-Content -LiteralPath $marker -Value $markerText -Encoding UTF8
+
+        Write-Host "Host snapshot SHA256 verified." -ForegroundColor Green
+        Write-Host "Prepared temporary session cache: $destination"
         return [PSCustomObject]@{
             Path = $destination
-            LoadName = [IO.Path]::GetFileNameWithoutExtension($destination)
+            LoadName = $cacheName
+            GameName = $cacheName
+            HostSnapshotName = $metaName
             SHA256 = $actualHash
         }
     }
@@ -206,6 +246,10 @@ try {
     $code = $null
     $expiresAt = $null
     $loadSaveName = $null
+    $sessionCachePath = $null
+    $sessionCacheName = $null
+    $sessionCacheGameName = $null
+    $hostSnapshotName = $null
 
     Write-Host "=== COI-Coop INTERNET $Mode ==="
     Write-Host "Relay: $baseUrl"
@@ -214,7 +258,8 @@ try {
     if ($Mode -eq "Host") {
         $sourceSavePath = Resolve-SourceSave $SourceSaveName
         $loadSaveName = [IO.Path]::GetFileNameWithoutExtension($sourceSavePath)
-        Write-Host "Host save: $sourceSavePath"
+        $hostSnapshotName = [IO.Path]::GetFileName($sourceSavePath)
+        Write-Host "Canonical host world: $sourceSavePath"
         Write-Host "Creating co-op session..."
         $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session" -ContentType "application/json" -Body "{}" -TimeoutSec 60
 
@@ -237,18 +282,19 @@ try {
             Write-Host "Expires: $expiresAt"
         }
         Write-Host ""
-        Write-Host "The client launcher will download and SHA256-verify this exact host save automatically." -ForegroundColor Green
-        Write-Host "1. Your friend starts the Internet client with this code."
-        Write-Host "2. Their launcher prints the synchronized *_CLIENT save name."
-        Write-Host "3. Your friend loads that save and waits in the world."
+        Write-Host "This HOST save is the only canonical campaign world." -ForegroundColor Green
+        Write-Host "The client receives a disposable verified mirror; it does not own a second campaign save."
+        Write-Host "1. Your friend starts Join with this code."
+        Write-Host "2. Their launcher downloads and verifies the host-world snapshot."
+        Write-Host "3. Current conservative prototype waits until the client mirror is loaded."
         Write-Host "4. Only then press ENTER here to start the HOST game." -ForegroundColor Green
         Write-Host ""
         Write-Host "If gameplay disconnects, this code is intentionally invalidated." -ForegroundColor Yellow
-        Write-Host "For conservative recovery: save the current HOST world, then create a NEW session from that save."
+        Write-Host "For recovery: save the current HOST world and create a NEW session from that host save."
         Write-Host ""
-        [void](Read-Host "Press ENTER after the client synchronized save is loaded")
+        [void](Read-Host "Press ENTER after the client reports the host world is loaded")
         Write-Host "Starting host Captain of Industry..."
-        Write-Host "LOAD HOST SAVE: $loadSaveName" -ForegroundColor Yellow
+        Write-Host "CANONICAL HOST WORLD: $loadSaveName" -ForegroundColor Yellow
         Write-Host ""
     }
     else {
@@ -260,14 +306,14 @@ try {
             throw "Session code must contain exactly 8 letters/digits (for example ABCD-2345)."
         }
 
-        Write-Host "Joining session $code..."
+        Write-Host "Joining host world for session $code..."
         try {
             $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/session/$code/join" -ContentType "application/json" -Body "{}" -TimeoutSec 60
         }
         catch {
             $status = Get-HttpStatusCodeFromError $_
             if ($status -eq 409) {
-                throw "RESYNC REQUIRED: gameplay in session $code was already connected and then disconnected. Reusing this code with an old save is unsafe. Ask the host to save the current world and create a NEW session; the new launcher will transfer that fresh snapshot automatically."
+                throw "RESYNC REQUIRED: this host session disconnected. Ask the host to save the current canonical world and create a NEW session; Join will fetch that fresh host snapshot automatically."
             }
             throw
         }
@@ -281,13 +327,19 @@ try {
         $snapshotMeta = Get-SnapshotMetaFromJoin $response
         $installedSnapshot = Download-SessionSnapshot -BaseUrl $baseUrl -Code $code -ClientToken $token -SnapshotMeta $snapshotMeta
         $loadSaveName = [string]($installedSnapshot.LoadName)
+        $sessionCacheName = [string]($installedSnapshot.LoadName)
+        $sessionCacheGameName = [string]($installedSnapshot.GameName)
+        $sessionCachePath = [string]($installedSnapshot.Path)
+        $hostSnapshotName = [string]($installedSnapshot.HostSnapshotName)
 
         Write-Host "Session accepted." -ForegroundColor Green
         if (-not [string]::IsNullOrWhiteSpace($expiresAt)) {
             Write-Host "Expires: $expiresAt"
         }
-        Write-Host "LOAD THIS SAVE: $loadSaveName" -ForegroundColor Yellow
+        Write-Host "Temporary host-world mirror prepared." -ForegroundColor Green
+        Write-Host "SESSION CACHE: $loadSaveName" -ForegroundColor Yellow
         Write-Host ("SHA256: " + [string]($installedSnapshot.SHA256)) -ForegroundColor Green
+        Write-Host "This cache is disposable and is NOT a client-owned campaign save." -ForegroundColor Cyan
         Write-Host ""
     }
 
@@ -298,6 +350,20 @@ try {
     $env:COI_COOP_RELAY_WS = $wsUrl
     $env:COI_COOP_SESSION_CODE = $code
     $env:COI_COOP_SESSION_TOKEN = $token
+    $env:COI_COOP_HOST_SNAPSHOT_NAME = $hostSnapshotName
+
+    if ($Mode -eq "Client") {
+        $env:COI_COOP_SESSION_CACHE_PATH = $sessionCachePath
+        $env:COI_COOP_SESSION_CACHE_NAME = $sessionCacheName
+        $env:COI_COOP_SESSION_CACHE_GAME = $sessionCacheGameName
+        $env:COI_COOP_AUTOJOIN = "1"
+    }
+    else {
+        Remove-Item Env:COI_COOP_SESSION_CACHE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:COI_COOP_SESSION_CACHE_NAME -ErrorAction SilentlyContinue
+        Remove-Item Env:COI_COOP_SESSION_CACHE_GAME -ErrorAction SilentlyContinue
+        Remove-Item Env:COI_COOP_AUTOJOIN -ErrorAction SilentlyContinue
+    }
 
     $launcher = Join-Path $PSScriptRoot "launch-coop.ps1"
     & $launcher -Mode $Mode -CoiRoot $CoiRoot -Port $Port -Replay
