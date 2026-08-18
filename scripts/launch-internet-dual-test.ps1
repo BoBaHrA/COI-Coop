@@ -62,10 +62,10 @@ try {
     Write-Host "=== COI-Coop SINGLE-PC INTERNET DUAL TEST ===" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Refreshing byte-identical test saves from '$SourceSaveName'..."
+    # This is another PowerShell script, not an external process. With StrictMode,
+    # $LASTEXITCODE may be unset here. Any preparation failure is already a
+    # terminating exception because both scripts use ErrorActionPreference=Stop.
     & (Join-Path $PSScriptRoot "prepare-replay-saves.ps1") -SourceSaveName $SourceSaveName
-    if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
-        throw "Save preparation failed with exit code $LASTEXITCODE."
-    }
 
     $baseUrl = Normalize-RelayBase $RelayUrl
     $wsUrl = To-WebSocketUrl $baseUrl
