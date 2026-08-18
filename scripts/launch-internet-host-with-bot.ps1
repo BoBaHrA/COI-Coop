@@ -40,6 +40,17 @@ function Get-CoiProcesses {
     )
 }
 
+function Wait-ForCoiExit([int]$Seconds) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    do {
+        $remaining = @(Get-CoiProcesses)
+        if ($remaining.Count -eq 0) { return @() }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    return @(Get-CoiProcesses)
+}
+
 function Ensure-NoCoiProcesses {
     $running = @(Get-CoiProcesses)
     if ($running.Count -eq 0) { return }
@@ -63,11 +74,21 @@ function Ensure-NoCoiProcesses {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
     }
 
-    Start-Sleep -Milliseconds 750
-    $remaining = @(Get-CoiProcesses)
+    $remaining = @(Wait-ForCoiExit 5)
+    if ($remaining.Count -gt 0) {
+        Write-Host "COI did not exit promptly; using taskkill fallback..." -ForegroundColor Yellow
+        foreach ($process in $remaining) {
+            $taskkillOutput = & taskkill.exe /PID $process.Id /T /F 2>&1
+            if ($taskkillOutput) {
+                $taskkillOutput | ForEach-Object { Write-Host ("  " + $_) }
+            }
+        }
+        $remaining = @(Wait-ForCoiExit 5)
+    }
+
     if ($remaining.Count -gt 0) {
         $ids = ($remaining | ForEach-Object { [string]$_.Id }) -join ", "
-        throw "Some Captain of Industry processes are still running (PID: $ids). Close them manually and retry."
+        throw "Some Captain of Industry processes are still running after Stop-Process and taskkill (PID: $ids). Restart Windows or close them from Task Manager, then retry."
     }
 
     Write-Host "Previous COI processes closed." -ForegroundColor Green
