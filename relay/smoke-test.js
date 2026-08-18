@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { WebSocket } = require('ws');
 
@@ -34,6 +35,46 @@ async function postJson(url) {
   const body = await response.json();
   if (!response.ok) throw new Error(`${url} -> ${response.status}: ${JSON.stringify(body)}`);
   return body;
+}
+
+async function putSnapshot(code, hostToken, name, payload) {
+  const response = await fetch(`${baseUrl}/api/session/${encodeURIComponent(code)}/snapshot`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${hostToken}`,
+      'content-type': 'application/octet-stream',
+      'x-coi-save-name': name
+    },
+    body: payload
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(`snapshot upload -> ${response.status}: ${JSON.stringify(body)}`);
+  return body;
+}
+
+async function getSnapshotMeta(code, clientToken) {
+  const response = await fetch(`${baseUrl}/api/session/${encodeURIComponent(code)}/snapshot/meta`, {
+    headers: { Authorization: `Bearer ${clientToken}` }
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(`snapshot meta -> ${response.status}: ${JSON.stringify(body)}`);
+  return body;
+}
+
+async function getSnapshot(code, clientToken) {
+  const response = await fetch(`${baseUrl}/api/session/${encodeURIComponent(code)}/snapshot`, {
+    headers: { Authorization: `Bearer ${clientToken}` }
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`snapshot download -> ${response.status}: ${text}`);
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  return {
+    bytes,
+    sha256: response.headers.get('x-coi-save-sha256'),
+    name: response.headers.get('x-coi-save-name')
+  };
 }
 
 function openSocket(code, role, lane, token) {
@@ -118,7 +159,8 @@ async function main() {
     env: {
       ...process.env,
       PORT: String(port),
-      SESSION_TTL_MS: '60000'
+      SESSION_TTL_MS: '60000',
+      MAX_SNAPSHOT_BYTES: String(2 * 1024 * 1024)
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -137,8 +179,39 @@ async function main() {
     const created = await postJson(`${baseUrl}/api/session`);
     if (!created.code || !created.hostToken) throw new Error('create session response missing fields');
 
+    const snapshotPayload = Buffer.concat([
+      Buffer.from('COI-SNAPSHOT-SMOKE\0', 'utf8'),
+      crypto.randomBytes(8192)
+    ]);
+    const expectedSnapshotHash = crypto.createHash('sha256').update(snapshotPayload).digest('hex').toUpperCase();
+    const uploaded = await putSnapshot(created.code, created.hostToken, 'COOP_SMOKE_HOST.save', snapshotPayload);
+    if (uploaded.sha256 !== expectedSnapshotHash
+        || uploaded.size !== snapshotPayload.length
+        || uploaded.name !== 'COOP_SMOKE_HOST.save') {
+      throw new Error(`snapshot upload metadata mismatch: ${JSON.stringify(uploaded)}`);
+    }
+
     const joined = await postJson(`${baseUrl}/api/session/${encodeURIComponent(created.code)}/join`);
     if (!joined.clientToken) throw new Error('join response missing client token');
+    if (!joined.snapshot
+        || joined.snapshot.sha256 !== expectedSnapshotHash
+        || joined.snapshot.size !== snapshotPayload.length) {
+      throw new Error(`join response missing correct snapshot metadata: ${JSON.stringify(joined)}`);
+    }
+
+    const meta = await getSnapshotMeta(created.code, joined.clientToken);
+    if (meta.sha256 !== expectedSnapshotHash || meta.size !== snapshotPayload.length) {
+      throw new Error(`snapshot metadata mismatch: ${JSON.stringify(meta)}`);
+    }
+
+    const downloaded = await getSnapshot(created.code, joined.clientToken);
+    const downloadedHash = crypto.createHash('sha256').update(downloaded.bytes).digest('hex').toUpperCase();
+    if (!downloaded.bytes.equals(snapshotPayload)
+        || downloadedHash !== expectedSnapshotHash
+        || downloaded.sha256 !== expectedSnapshotHash
+        || downloaded.name !== 'COOP_SMOKE_HOST.save') {
+      throw new Error('snapshot download did not match the exact uploaded bytes/hash/name');
+    }
 
     host = await openSocket(created.code, 'host', 0, created.hostToken);
     client = await openSocket(created.code, 'client', 0, joined.clientToken);
@@ -163,14 +236,15 @@ async function main() {
     await delay(150);
     previewClient2 = await openSocket(created.code, 'client', 1, joined.clientToken);
 
-    // Gameplay is deliberately fail-closed until snapshot/catch-up exists.
+    // Gameplay remains fail-closed after disconnect. Conservative recovery uses
+    // a fresh session with a newly published host snapshot.
     client.terminate();
     client = null;
     await delay(200);
     await expectJoinResyncRequired(created.code);
     await expectGameplayReconnectRejected(created.code, joined.clientToken);
 
-    console.log('RELAY SMOKE PASS - binary relay works, sidecars reconnect, gameplay reconnect requires resync');
+    console.log('RELAY SMOKE PASS - snapshot round-trip is byte-identical, binary relay works, sidecars reconnect, gameplay reconnect requires fresh-snapshot resync');
   } finally {
     try { host?.terminate(); } catch { }
     try { client?.terminate(); } catch { }
