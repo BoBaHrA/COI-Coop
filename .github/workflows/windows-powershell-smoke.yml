@@ -37,6 +37,10 @@ jobs:
         shell: powershell
         run: .\scripts\launch-internet-host-with-bot.ps1 -SelfTestHelpers
 
+      - name: Run live launcher helper tests
+        shell: powershell
+        run: .\scripts\play-coop.ps1 -SelfTestHelpers
+
       - name: Build headless relay test peer
         shell: powershell
         run: dotnet build tools/CoiCoop.TestPeer/CoiCoop.TestPeer.csproj -c Release --nologo

@@ -23,6 +23,9 @@ internal sealed class PersistentCommandSession : IDisposable {
     private readonly int m_port;
     private readonly Action<string> m_log;
     private readonly string m_baselineId;
+    private readonly string m_remoteHost;
+    private readonly IPAddress m_bindAddress;
+    private readonly string m_sessionKey;
     private readonly ConcurrentQueue<string> m_outgoing = new ConcurrentQueue<string>();
     private readonly ConcurrentQueue<ReceivedAuthorityCommand> m_incoming = new ConcurrentQueue<ReceivedAuthorityCommand>();
     private readonly ConcurrentQueue<StateProbeSnapshot> m_incomingStateProbes = new ConcurrentQueue<StateProbeSnapshot>();
@@ -43,11 +46,16 @@ internal sealed class PersistentCommandSession : IDisposable {
     private TcpListener m_listener;
     private TcpClient m_client;
 
-    public PersistentCommandSession(bool isHost, int port, Action<string> log = null) {
+    public PersistentCommandSession(bool isHost, int port, Action<string> log = null,
+        string baselineId = null, string remoteHost = "127.0.0.1", IPAddress bindAddress = null,
+        string sessionKey = null) {
         m_isHost = isHost;
         m_port = port;
         m_log = log;
-        m_baselineId = NormalizeBaselineId(Environment.GetEnvironmentVariable("COI_COOP_BASELINE_SHA256"));
+        m_baselineId = NormalizeBaselineId(baselineId ?? Environment.GetEnvironmentVariable("COI_COOP_BASELINE_SHA256"));
+        m_remoteHost = remoteHost;
+        m_bindAddress = bindAddress ?? IPAddress.Loopback;
+        m_sessionKey = sessionKey;
     }
 
     public bool IsHost => m_isHost;
@@ -246,9 +254,9 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     private void RunHost() {
-        m_listener = new TcpListener(IPAddress.Loopback, m_port);
+        m_listener = new TcpListener(m_bindAddress, m_port);
         m_listener.Start();
-        m_log?.Invoke("HOST listening on 127.0.0.1:" + m_port);
+        m_log?.Invoke("HOST listening on " + m_bindAddress + ":" + m_port);
 
         while (!m_stop) {
             if (!m_listener.Pending()) {
@@ -264,7 +272,9 @@ internal sealed class PersistentCommandSession : IDisposable {
                 using (var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) {
                     var reader = new WireLineReader(client);
                     var hello = reader.ReadHandshake(() => m_stop);
-                    if (!NetworkProtocol.IsCompatibleHello(hello)) {
+                    var expectedHello = NetworkProtocol.Hello()
+                        + (m_sessionKey == null ? "" : "|" + m_sessionKey);
+                    if (!string.Equals(hello, expectedHello, StringComparison.Ordinal)) {
                         writer.WriteLine("REJECT|INCOMPATIBLE_PROTOCOL");
                         continue;
                     }
@@ -299,12 +309,13 @@ internal sealed class PersistentCommandSession : IDisposable {
             m_client = client;
             try {
                 ConfigureClient(client);
-                client.Connect(IPAddress.Loopback, m_port);
+                client.Connect(m_remoteHost, m_port);
 
                 using (var stream = client.GetStream())
                 using (var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) {
                     var reader = new WireLineReader(client);
-                    writer.WriteLine(NetworkProtocol.Hello());
+                    writer.WriteLine(NetworkProtocol.Hello()
+                        + (m_sessionKey == null ? "" : "|" + m_sessionKey));
                     var welcome = reader.ReadHandshake(() => m_stop);
                     if (welcome == "REJECT|RESYNC_REQUIRED") m_requiresResync = true;
                     if (!NetworkProtocol.IsCompatibleWelcome(welcome)) {

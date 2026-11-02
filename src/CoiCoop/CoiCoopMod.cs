@@ -75,6 +75,7 @@ public sealed class CoiCoopMod : IMod {
     private int m_stateMismatchStreak;
     private bool m_gameHooksAttached;
     private int m_networkStarted;
+    private LiveCoopController m_live;
 
     public ModManifest Manifest { get; }
 
@@ -102,6 +103,10 @@ public sealed class CoiCoopMod : IMod {
     }
 
     public void Initialize(DependencyResolver resolver, bool gameWasLoaded) {
+        if (Environment.GetEnvironmentVariable("COI_COOP_LIVE") == "1") {
+            m_live = new LiveCoopController(resolver, System.IO.Path.Combine(Manifest.RootDirectoryPath, "CoiCoop.dll"));
+            return;
+        }
         m_resolver = resolver;
         m_roundTripProbe = new CommandRoundTripProbe(resolver);
         m_worldStateFingerprintBuilder = new WorldStateFingerprintBuilder(resolver);
@@ -939,6 +944,8 @@ public sealed class CoiCoopMod : IMod {
     }
 
     public void Dispose() {
+        m_live?.Dispose();
+        m_live = null;
         if (m_resolver != null) {
             m_resolver.ObjectInstantiated -= OnObjectInstantiated;
         }
