@@ -5,7 +5,7 @@ namespace CoiCoop.Networking;
 
 internal static class NetworkProtocol {
     public const int ProtocolVersion = 5;
-    public const string ModVersion = "0.0.1";
+    public const string ModVersion = "0.1.0";
 
     public static string Hello() => $"HELLO|{ProtocolVersion}|{ModVersion}";
     public static string Welcome() => $"WELCOME|{ProtocolVersion}|{ModVersion}";

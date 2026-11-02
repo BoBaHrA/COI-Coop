@@ -2,7 +2,7 @@ using System.Net.WebSockets;
 using System.Text;
 
 const int ProtocolVersion = 5;
-const string ModVersion = "0.0.1";
+const string ModVersion = "0.1.0";
 const string PreviewHello = "COI_COOP_PREVIEW|1";
 const string PreviewWelcome = "COI_COOP_PREVIEW_OK|1";
 

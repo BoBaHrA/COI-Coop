@@ -1,16 +1,19 @@
 # COI-Coop
 
-> **Development status (2026-11-02): not a playable drop-in co-op release.**
-> Network tests do not validate game simulation synchronization. Joining an
-> already running world, automatic snapshot loading, solo host continuation and
-> reconnect recovery still need game integration. See
-> [the host-world audit and acceptance gate](docs/HOST_WORLD_AUDIT.md).
+> **0.1.0 live-host preview (CoI 0.8.8.0): in-game acceptance still required.**
+> Live snapshot join, host solo continuation and fresh-snapshot rejoin are now
+> implemented in a separate direct-TCP path. The mod builds against the supplied
+> game assemblies, and its simulation gate has been tested on the real engine.
+> A complete two-player Unity/island session has not yet been validated.
+> [Windows quick start (RU)](docs/LIVE_HOST_QUICKSTART_RU.md) ·
+> [Implementation and test scope](docs/LIVE_HOST_IMPLEMENTATION.md) ·
+> [Original audit](docs/HOST_WORLD_AUDIT.md)
 
 Experimental two-player shared-world co-op mod for **Captain of Industry**.
 
 ![Transport smoke test](https://github.com/BoBaHrA/COI-Coop/actions/workflows/transport-smoke-test.yml/badge.svg?branch=dev%2Fnetwork-foundation)
 
-Development is currently on `dev/network-foundation`.
+Live-host development is on `feat/live-host-world`; earlier networking experiments are on `dev/network-foundation`.
 
 ## Goal
 
@@ -30,7 +33,7 @@ This is not separate-player simulation, PvP, or independent economies.
 - Example: if both players order the same ship to different destinations nearly simultaneously, the latest accepted valid destination wins.
 - Order-sensitive commands such as toggles are never collapsed blindly.
 
-## Current status
+## Earlier prototype status (legacy mode)
 
 - Native COI mod manifest and .NET Framework 4.8 project.
 - Explicit `CoiCoop.CoiCoopMod` entry point using the `IMod` lifecycle.
@@ -43,7 +46,7 @@ This is not separate-player simulation, PvP, or independent economies.
 - Host authority sequencing, duplicate suppression, and latest-intent batch collapse added.
 - Windows helper scripts for automatic build/deploy and filtered diagnostic collection.
 
-## Next milestones
+## Earlier prototype milestones
 
 1. Verify command serialization round-trip on the current game build.
 2. Send the first serialized command packet between two game instances.

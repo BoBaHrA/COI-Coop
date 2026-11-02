@@ -29,5 +29,8 @@ jobs:
       - name: Run session lifecycle regression tests
         run: dotnet run --project tools/SessionLifecycleSmokeTest/SessionLifecycleSmokeTest.csproj --configuration Release
 
+      - name: Run live world snapshot and rejoin tests
+        run: dotnet run --project tools/LiveWorldSmokeTest/LiveWorldSmokeTest.csproj --configuration Release
+
       - name: Run preview sidecar smoke test
         run: dotnet run --project tools/PreviewSmokeTest/PreviewSmokeTest.csproj --configuration Release

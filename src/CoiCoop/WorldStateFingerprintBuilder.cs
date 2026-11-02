@@ -29,6 +29,10 @@ internal sealed class WorldStateFingerprintBuilder {
     public WorldStateFingerprintBuilder(DependencyResolver resolver) {
         m_resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
 
+        // Live sessions own their authenticated transport. Legacy sidecars
+        // mutate sandbox state out of band and must not attach to this mode.
+        if (Environment.GetEnvironmentVariable("COI_COOP_LIVE") == "1") return;
+
         // Transitional bridges must own the client-side loopback ports before any
         // of the proven loopback sessions begin their retry loops. They are gated
         // independently by environment variables; normal development loopback
