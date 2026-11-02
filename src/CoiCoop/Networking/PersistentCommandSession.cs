@@ -34,6 +34,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     private volatile bool m_connected;
     private volatile bool m_localGameplayReady;
     private volatile bool m_peerGameplayReady;
+    private volatile bool m_requiresResync;
     private long m_nextLocalCommandId;
     private long m_currentHostAuthorityFrame = -1;
     private long m_latestAnnouncedAuthorityFrame = -1;
@@ -53,6 +54,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     public bool IsConnected => m_connected;
     public bool IsGameplayReady => m_localGameplayReady;
     public bool PeerGameplayReady => m_peerGameplayReady;
+    public bool RequiresResync => m_requiresResync;
     public string LocalClientId => m_isHost ? "host" : "client";
     public string LocalBaselineId => m_baselineId;
     public long LatestAnnouncedAuthorityFrame => Interlocked.Read(ref m_latestAnnouncedAuthorityFrame);
@@ -170,7 +172,8 @@ internal sealed class PersistentCommandSession : IDisposable {
         if (payload == null) throw new ArgumentNullException(nameof(payload));
 
         clientCommandId = -1;
-        if (!m_connected || !m_localGameplayReady) {
+        if (!m_connected || !m_localGameplayReady || m_requiresResync
+            || (m_isHost && !m_peerGameplayReady)) {
             return false;
         }
 
@@ -258,18 +261,22 @@ internal sealed class PersistentCommandSession : IDisposable {
             try {
                 ConfigureClient(client);
                 using (var stream = client.GetStream())
-                using (var reader = new StreamReader(stream, Encoding.UTF8))
                 using (var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) {
-
-                    var hello = reader.ReadLine();
+                    var reader = new WireLineReader(client);
+                    var hello = reader.ReadHandshake(() => m_stop);
                     if (!NetworkProtocol.IsCompatibleHello(hello)) {
                         writer.WriteLine("REJECT|INCOMPATIBLE_PROTOCOL");
                         continue;
                     }
 
+                    if (m_requiresResync) {
+                        writer.WriteLine("REJECT|RESYNC_REQUIRED");
+                        continue;
+                    }
+
                     writer.WriteLine(NetworkProtocol.Welcome());
                     SetConnected();
-                    RunConnected(stream, reader, writer);
+                    RunConnected(reader, writer);
                 }
             }
             catch (IOException ex) {
@@ -287,7 +294,7 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     private void RunClient() {
-        while (!m_stop) {
+        while (!m_stop && !m_requiresResync) {
             var client = new TcpClient();
             m_client = client;
             try {
@@ -295,16 +302,17 @@ internal sealed class PersistentCommandSession : IDisposable {
                 client.Connect(IPAddress.Loopback, m_port);
 
                 using (var stream = client.GetStream())
-                using (var reader = new StreamReader(stream, Encoding.UTF8))
                 using (var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) {
-
+                    var reader = new WireLineReader(client);
                     writer.WriteLine(NetworkProtocol.Hello());
-                    if (!NetworkProtocol.IsCompatibleWelcome(reader.ReadLine())) {
+                    var welcome = reader.ReadHandshake(() => m_stop);
+                    if (welcome == "REJECT|RESYNC_REQUIRED") m_requiresResync = true;
+                    if (!NetworkProtocol.IsCompatibleWelcome(welcome)) {
                         throw new IOException("Host rejected protocol handshake.");
                     }
 
                     SetConnected();
-                    RunConnected(stream, reader, writer);
+                    RunConnected(reader, writer);
                 }
             }
             catch (IOException ex) {
@@ -326,22 +334,28 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     private void RunConnected(
-        NetworkStream stream,
-        StreamReader reader,
+        WireLineReader reader,
         StreamWriter writer) {
-
+        var lastReceive = Environment.TickCount;
+        var lastPing = lastReceive;
         while (!m_stop) {
-            while (m_outgoing.TryDequeue(out var line)) {
+            // Bound each batch so a busy sender cannot starve receive/heartbeat.
+            for (var i = 0; i < 256 && m_outgoing.TryDequeue(out var line); i++) {
                 writer.WriteLine(line);
             }
 
-            while (stream.DataAvailable) {
-                var line = reader.ReadLine();
-                if (line == null) {
-                    throw new IOException("Peer closed the connection.");
-                }
-
+            for (var i = 0; i < 256 && reader.TryReadLine(out var line); i++) {
+                lastReceive = Environment.TickCount;
                 HandleIncomingLine(line);
+            }
+
+            var now = Environment.TickCount;
+            if (unchecked(now - lastReceive) >= 15000) {
+                throw new IOException("Peer heartbeat timed out; fresh host snapshot required.");
+            }
+            if (unchecked(now - lastPing) >= 1000) {
+                writer.WriteLine(NetworkProtocol.Ping(now));
+                lastPing = now;
             }
 
             Thread.Sleep(LoopSleepMs);
@@ -408,6 +422,12 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     private void HandleHostLine(string line) {
+        // A matching HELLO is not permission to mutate the host world. In
+        // particular, a rejected snapshot must never submit gameplay commands.
+        if (!m_peerGameplayReady || m_requiresResync) {
+            m_log?.Invoke("HOST ignored gameplay before verified READY");
+            return;
+        }
         if (!NetworkProtocol.TryReadSubmit(line, out var clientCommandId, out var payload)) {
             m_log?.Invoke("HOST ignored malformed message");
             return;
@@ -483,7 +503,6 @@ internal sealed class PersistentCommandSession : IDisposable {
     }
 
     private void SetConnected() {
-        m_connected = true;
         m_localGameplayReady = false;
         m_peerGameplayReady = false;
         Interlocked.Exchange(ref m_peerProgressFrame, -1);
@@ -493,12 +512,19 @@ internal sealed class PersistentCommandSession : IDisposable {
         }
         while (m_incomingStateProbes.TryDequeue(out _)) {
         }
+        m_connected = true;
         m_log?.Invoke(
             (m_isHost ? "HOST session connected" : "CLIENT session connected")
             + " baseline=" + ShortBaseline(m_baselineId));
     }
 
     private void SetDisconnected() {
+        // This transport has no snapshot reload/catch-up adapter yet. Never
+        // silently reuse frame/sequence counters against a freshly loaded guest.
+        if (Interlocked.Read(ref m_latestAnnouncedAuthorityFrame) >= 0
+            || (m_connected && (m_isHost ? m_peerGameplayReady : m_localGameplayReady))) {
+            m_requiresResync = true;
+        }
         if (m_connected) {
             m_log?.Invoke(m_isHost ? "HOST session disconnected" : "CLIENT session disconnected");
         }
@@ -526,6 +552,66 @@ internal sealed class PersistentCommandSession : IDisposable {
         client.NoDelay = true;
         client.ReceiveTimeout = 5000;
         client.SendTimeout = 5000;
+    }
+
+    /// <summary>
+    /// Owns both buffered and socket bytes. StreamReader.ReadLine combined with
+    /// NetworkStream.DataAvailable can strand complete buffered FRAME messages,
+    /// and block all outgoing traffic on an incomplete incoming line.
+    /// </summary>
+    private sealed class WireLineReader {
+        private const int MaxLineBytes = 16 * 1024 * 1024;
+        private readonly TcpClient m_socket;
+        private readonly NetworkStream m_stream;
+        private readonly byte[] m_buffer = new byte[8192];
+        private readonly MemoryStream m_partial = new MemoryStream();
+        private int m_offset;
+        private int m_count;
+
+        public WireLineReader(TcpClient socket) {
+            m_socket = socket;
+            m_stream = socket.GetStream();
+        }
+
+        public string ReadHandshake(Func<bool> stopped) {
+            var started = Environment.TickCount;
+            while (!stopped()) {
+                if (TryReadLine(out var line)) return line;
+                if (unchecked(Environment.TickCount - started) >= 5000)
+                    throw new IOException("Protocol handshake timed out.");
+                Thread.Sleep(LoopSleepMs);
+            }
+            throw new IOException("Session stopped during handshake.");
+        }
+
+        public bool TryReadLine(out string line) {
+            line = null;
+            // At most one socket read per call: partial lines cannot starve TX.
+            var readSocket = false;
+            while (true) {
+                while (m_offset < m_count) {
+                    var next = m_buffer[m_offset++];
+                    if (next == (byte)'\n') {
+                        line = Encoding.UTF8.GetString(m_partial.GetBuffer(), 0, (int)m_partial.Length).TrimEnd('\r');
+                        m_partial.SetLength(0);
+                        return true;
+                    }
+                    if (m_partial.Length >= MaxLineBytes)
+                        throw new IOException("Protocol line exceeds size limit.");
+                    m_partial.WriteByte(next);
+                }
+                if (readSocket) return false;
+                if (!m_stream.DataAvailable) {
+                    if (m_socket.Client.Poll(0, SelectMode.SelectRead) && m_socket.Available == 0)
+                        throw new IOException("Peer closed the connection.");
+                    return false;
+                }
+                m_count = m_stream.Read(m_buffer, 0, m_buffer.Length);
+                m_offset = 0;
+                readSocket = true;
+                if (m_count == 0) throw new IOException("Peer closed the connection.");
+            }
+        }
     }
 
     public void Dispose() {
