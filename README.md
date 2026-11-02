@@ -1,5 +1,11 @@
 # COI-Coop
 
+> **Development status (2026-11-02): not a playable drop-in co-op release.**
+> Network tests do not validate game simulation synchronization. Joining an
+> already running world, automatic snapshot loading, solo host continuation and
+> reconnect recovery still need game integration. See
+> [the host-world audit and acceptance gate](docs/HOST_WORLD_AUDIT.md).
+
 Experimental two-player shared-world co-op mod for **Captain of Industry**.
 
 ![Transport smoke test](https://github.com/BoBaHrA/COI-Coop/actions/workflows/transport-smoke-test.yml/badge.svg?branch=dev%2Fnetwork-foundation)

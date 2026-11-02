@@ -26,5 +26,8 @@ jobs:
       - name: Run snapshot baseline READY smoke test
         run: dotnet run --project tools/BaselineReadySmokeTest/BaselineReadySmokeTest.csproj --configuration Release
 
+      - name: Run session lifecycle regression tests
+        run: dotnet run --project tools/SessionLifecycleSmokeTest/SessionLifecycleSmokeTest.csproj --configuration Release
+
       - name: Run preview sidecar smoke test
         run: dotnet run --project tools/PreviewSmokeTest/PreviewSmokeTest.csproj --configuration Release
